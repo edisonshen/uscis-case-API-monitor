@@ -729,15 +729,43 @@ async function fetchSingleCase(receiptNumber, config) {
   }
 }
 
-async function sendDiscordWebhook(webhookUrl, payload) {
-  const res = await fetch(webhookUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    throw new Error(`Discord webhook failed: ${res.status} ${res.statusText}`);
+async function sendDiscordWebhook(webhookUrl, payload, opts = {}) {
+  // Retry transient network failures up to `attempts` times with 0/200/800 ms
+  // backoff. Do NOT retry on HTTP 4xx — those mean URL/payload is bad. On final
+  // failure, surface error.cause?.code and .message so we can diagnose undici
+  // socket-pool issues (see DESIGN-discord-cron-otp-and-heartbeat-fix.md §2.2).
+  const attempts = opts.attempts ?? 3;
+  const backoffMs = [0, 200, 800];
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    if (backoffMs[i]) await new Promise((r) => setTimeout(r, backoffMs[i]));
+    let res;
+    try {
+      res = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        keepalive: opts.keepalive ?? true,
+      });
+    } catch (err) {
+      // Network / fetch failure — retryable.
+      lastErr = err;
+      continue;
+    }
+    // Drain the response body so undici can release the socket. Discord
+    // responses are tiny; this is fire-and-forget.
+    res.body?.cancel().catch(() => {});
+    if (res.ok) return;
+    // 4xx — bad URL or payload, not transient. Surface immediately without retrying.
+    if (res.status >= 400 && res.status < 500) {
+      throw new Error(`Discord webhook failed: ${res.status} ${res.statusText}`);
+    }
+    // 5xx — retryable.
+    lastErr = new Error(`Discord webhook failed: ${res.status} ${res.statusText}`);
   }
+  const cause = lastErr?.cause;
+  const causeStr = cause ? ` (cause: ${cause.code ?? cause.name ?? "?"}: ${cause.message ?? ""})` : "";
+  throw new Error(`Discord webhook failed after ${attempts} attempts: ${lastErr?.message ?? "?"}${causeStr}`);
 }
 
 function buildDiscordEmbed(receiptNumber, caseData, changes) {
@@ -903,16 +931,21 @@ async function checkAllCases(config) {
       
       console.log("📊 Summary:");
       console.log(JSON.stringify(summary, null, 2));
-      
-      // Send Discord summary
-      const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
-      if (webhookUrl && summary.changedCases === 0) {
-        const ts = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
-        await sendDiscordWebhook(webhookUrl, {
-          content: `\`${ts}\` ✓ Checked ${summary.totalCases} cases — no changes found.`,
-        }).catch((e) => console.error(`Discord notify failed: ${e.message}`));
+
+      if (summary.changedCases === 0) {
+        const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
+        if (webhookUrl) {
+          const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+          // keepalive:false isolates this from the case-API undici socket pool —
+          // see DESIGN-discord-cron-otp-and-heartbeat-fix.md §2.2 for why.
+          await sendDiscordWebhook(
+            webhookUrl,
+            { content: `✅ \`${ts} UTC\` no changes found (${summary.totalCases} case${summary.totalCases === 1 ? "" : "s"} checked)` },
+            { keepalive: false },
+          ).catch((err) => console.error(`  ✗ Heartbeat failed: ${err.message}`));
+        }
       }
-      
+
       return summary; // Success, exit loop
       
     } catch (error) {
@@ -1019,7 +1052,7 @@ function nextScheduledRun() {
   
   // If within schedule, next run in 3h
   if (day >= 1 && day <= 5 && hour >= 9 && hour < 20) {
-    return 3 * 60 * 60 * 1000;
+    return 6 * 60 * 60 * 1000;
   }
   
   // Calculate time until next weekday 9am ET
@@ -1058,7 +1091,7 @@ async function scheduledCheck(config) {
       if (webhookUrl) {
         await sendDiscordWebhook(webhookUrl, {
           content: `❌ \`${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC\` Scheduled check failed: ${error.message}`,
-        }).catch(() => {});
+        }).catch((err) => console.error(`  ✗ Scheduled-check failure notification failed: ${err.message}`));
       }
     } else {
       throw error;
@@ -1068,7 +1101,7 @@ async function scheduledCheck(config) {
 
 async function runScheduler(config) {
   console.log("🕐 USCIS Case Monitor Scheduler started");
-  console.log("   Schedule: Weekdays 9am–8pm ET, every 3 hours");
+  console.log("   Schedule: Weekdays 9am–8pm ET, every 6 hours");
   console.log("   Press Ctrl+C to stop\n");
   
   const run = async () => {
@@ -1091,6 +1124,80 @@ async function runScheduler(config) {
   
   // Run immediately on start
   await run();
+}
+
+async function smsTest() {
+  const dbPath = path.join(process.env.HOME, "Library", "Messages", "chat.db");
+  if (!fs.existsSync(dbPath)) {
+    console.error(`❌ Messages DB not found at ${dbPath}`);
+    process.exit(1);
+  }
+
+  const query = `
+    SELECT
+      COALESCE(h.id, '?') AS sender,
+      COALESCE(m.service, '?') AS service,
+      datetime(m.date/1000000000 + 978307200, 'unixepoch', 'localtime') AS dt,
+      substr(COALESCE(m.text, ''), 1, 80) AS preview
+    FROM message m
+    LEFT JOIN handle h ON m.handle_id = h.ROWID
+    WHERE m.date >= (strftime('%s','now') - 86400 - 978307200) * 1000000000
+    ORDER BY m.date DESC
+    LIMIT 20;
+  `;
+
+  const result = await new Promise((resolve, reject) => {
+    const child = spawn("sqlite3", ["-separator", "\t", dbPath, query], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => (stdout += c.toString()));
+    child.stderr.on("data", (c) => (stderr += c.toString()));
+    child.on("error", reject);
+    child.on("close", (code) => (code === 0 ? resolve(stdout) : reject(new Error(stderr || `sqlite3 exited ${code}`))));
+  }).catch((err) => {
+    console.error(`❌ Failed to read Messages DB: ${err.message}`);
+    console.error("   Grant Full Disk Access to your terminal: System Settings → Privacy & Security → Full Disk Access");
+    process.exit(1);
+  });
+
+  const rows = result.split("\n").filter(Boolean).map((line) => {
+    const [sender, service, dt, preview] = line.split("\t");
+    return { sender, service, dt, preview };
+  });
+
+  if (rows.length === 0) {
+    console.log("⚠️  No messages in the last 24h.");
+    console.log("   If you have iMessages on your phone but none here, check that Messages.app on this Mac is signed in.");
+    console.log("   If you receive SMS on your phone but none here, enable Text Message Forwarding:");
+    console.log("     iPhone → Settings → Apps → Messages → Text Message Forwarding → toggle this Mac ON");
+    return;
+  }
+
+  const smsCount = rows.filter((r) => r.service === "SMS").length;
+  const iMessageCount = rows.filter((r) => r.service === "iMessage").length;
+  const uscisRows = rows.filter((r) => /uscis|85728|verification|secure/i.test(`${r.sender} ${r.preview}`));
+
+  console.log(`📬 Last 24h: ${rows.length} message(s) — ${smsCount} SMS, ${iMessageCount} iMessage\n`);
+  console.log("Recent messages:");
+  for (const r of rows.slice(0, 10)) {
+    console.log(`  [${r.service.padEnd(8)}] ${r.dt}  ${r.sender}`);
+    console.log(`             ${r.preview}`);
+  }
+
+  console.log();
+  if (smsCount === 0) {
+    console.log("❌ Zero SMS messages forwarded in last 24h.");
+    console.log("   USCIS sends from short code 85728 via SMS (not iMessage).");
+    console.log("   Enable forwarding: iPhone → Settings → Apps → Messages → Text Message Forwarding → toggle this Mac ON");
+    process.exit(2);
+  } else if (uscisRows.length === 0) {
+    console.log("✓ SMS forwarding is working (you have SMS in the DB).");
+    console.log("⚠️  But no USCIS / 85728 messages in the last 24h. Trigger a login and run this again to confirm.");
+  } else {
+    console.log(`✓ SMS forwarding works AND found ${uscisRows.length} USCIS-related message(s). Auto-OTP should work.`);
+  }
 }
 
 async function main() {
@@ -1120,6 +1227,25 @@ async function main() {
   if (command === "otp-test") {
     const code = await readOtpFromEmail(config.otp);
     console.log(code);
+    return;
+  }
+  if (command === "sms-test") {
+    await smsTest();
+    return;
+  }
+  if (command === "webhook-test") {
+    // Hidden: post 5 heartbeats sequentially to exercise the retry path.
+    const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
+    if (!webhookUrl) throw new Error("No Discord webhook URL configured");
+    for (let i = 1; i <= 5; i++) {
+      const ts = new Date().toISOString();
+      try {
+        await sendDiscordWebhook(webhookUrl, { content: `🧪 webhook-test ${i}/5 \`${ts}\`` }, { keepalive: false });
+        console.log(`  ✓ ${i}/5 sent`);
+      } catch (err) {
+        console.error(`  ✗ ${i}/5 failed: ${err.message}`);
+      }
+    }
     return;
   }
   if (command === "poll") {
