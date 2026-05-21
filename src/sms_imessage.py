@@ -15,6 +15,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+# Lowercase keywords that must appear (case-insensitive) in the message
+# haystack (m.text + printable runs extracted from m.attributedBody) for a
+# row to be considered an OTP carrier. Keep in sync with the SQL LIKE
+# filter so DB-side and Python-side filtering surface the same row set.
+OTP_KEYWORDS: tuple[str, ...] = ("verification", "uscis", "secure")
+
+
 @dataclass
 class MessageConfig:
     code_regex: str
@@ -42,6 +49,64 @@ def get_messages_db_path() -> str | None:
     if db_path.exists():
         return str(db_path)
     return None
+
+
+def extract_printable_runs(blob: bytes | None, min_run: int = 4) -> str:
+    """Scan ``blob`` and join runs of printable ASCII (0x20-0x7E) of length
+    >= ``min_run`` with single spaces.
+
+    macOS 13+ stores incoming SMS bodies in ``message.attributedBody`` as a
+    typedstream-encoded NSAttributedString and frequently leaves
+    ``message.text`` NULL. The body text is stored verbatim as readable
+    UTF-8 inside the blob; a printable-ASCII scan is sufficient to recover
+    it without taking on a typedstream parser dependency.
+    """
+    if not blob:
+        return ""
+    out: list[str] = []
+    run = bytearray()
+    for b in blob:
+        if 0x20 <= b <= 0x7E:
+            run.append(b)
+        else:
+            if len(run) >= min_run:
+                out.append(run.decode("ascii"))
+            run.clear()
+    if len(run) >= min_run:
+        out.append(run.decode("ascii"))
+    return " ".join(out)
+
+
+def extract_code_from_row(
+    text: str | None,
+    attributed_body: bytes | None,
+    code_regex: re.Pattern[str],
+    keywords: tuple[str, ...] = OTP_KEYWORDS,
+) -> str | None:
+    """Return the OTP code from a single Messages row, or ``None``.
+
+    Builds a combined haystack from ``text`` plus the printable-ASCII runs
+    extracted from ``attributed_body``, requires at least one keyword to
+    appear (case-insensitive), then runs ``code_regex`` against the
+    haystack and returns the first captured group (or full match if the
+    regex has no groups).
+    """
+    parts: list[str] = []
+    if text:
+        parts.append(text)
+    runs = extract_printable_runs(attributed_body)
+    if runs:
+        parts.append(runs)
+    if not parts:
+        return None
+    haystack = " ".join(parts)
+    lowered = haystack.lower()
+    if not any(kw in lowered for kw in keywords):
+        return None
+    matched = code_regex.search(haystack)
+    if not matched:
+        return None
+    return matched.group(1) if matched.groups() else matched.group(0)
 
 
 def poll_for_code_from_messages(config: MessageConfig) -> str:
@@ -79,54 +144,70 @@ def poll_for_code_from_messages(config: MessageConfig) -> str:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
-            # Query messages containing verification keywords (SMS or iMessage)
-            # Note: date in Messages is in nanoseconds (Unix epoch * 1 billion + macOS epoch offset)
-            # macOS epoch (Jan 1, 2001) is 978307200 seconds after Unix epoch (Jan 1, 1970)
+            # Query messages that *might* carry an OTP. Two routes:
+            #   (1) m.text LIKE keyword  — fast path on macOS <13 and on rows
+            #       where iMessage still populates the text column.
+            #   (2) m.attributedBody IS NOT NULL — on macOS 13+ incoming SMS
+            #       frequently land with text=NULL and the body lives only in
+            #       the typedstream blob. We over-select here and then apply
+            #       the keyword filter in Python against the printable runs
+            #       extracted from the blob (see extract_code_from_row).
+            # date is macOS nanoseconds (Unix epoch + 978307200s offset).
             cursor.execute("""
-                SELECT m.ROWID, m.text, m.date, m.service
+                SELECT m.ROWID, m.text, m.attributedBody, m.date, m.service
                 FROM message m
                 WHERE m.date >= ?
-                AND m.text IS NOT NULL
-                AND (m.text LIKE '%verification%' OR m.text LIKE '%secure%' OR m.text LIKE '%USCIS%')
+                AND (
+                    (m.text IS NOT NULL
+                     AND (m.text LIKE '%verification%'
+                          OR m.text LIKE '%secure%'
+                          OR m.text LIKE '%USCIS%'))
+                    OR m.attributedBody IS NOT NULL
+                )
                 ORDER BY m.date DESC
                 LIMIT 100
             """, (cutoff_ns,))
 
             candidates = []
             rows = cursor.fetchall()
-            
+
             if rows:
                 print(
-                    f"[sms-test] Found {len(rows)} message(s) with verification keywords",
+                    f"[sms-test] Found {len(rows)} candidate message(s) "
+                    f"(text-keyword or attributedBody)",
                     file=sys.stderr,
                     flush=True,
                 )
                 for row in rows:
                     text = row["text"]
+                    attributed = row["attributedBody"]
                     service = row["service"] or "unknown"
-                    if not text:
-                        continue
-                    
-                    matched = pattern.search(text)
-                    if matched:
-                        code = matched.group(1) if matched.groups() else matched.group(0)
+
+                    code = extract_code_from_row(text, attributed, pattern)
+                    if code:
                         created_at = row["date"]
-                        candidates.append((created_at, code, text, service))
+                        # Prefer text for the preview snippet; fall back to
+                        # the first ~75 chars of the recovered printable
+                        # runs so the log line stays useful when text=NULL.
+                        preview = text if text else extract_printable_runs(attributed)
+                        candidates.append((created_at, code, preview, service))
                         print(
-                            f"[sms-test]   ✓ Found code '{code}' via {service}: {text[:75]!r}",
+                            f"[sms-test]   ✓ Found code '{code}' via {service}: "
+                            f"{preview[:75]!r}",
                             file=sys.stderr,
                             flush=True,
                         )
             else:
                 print(
-                    f"[sms-test] No recent messages with verification keywords (looked back {config.since_seconds}s)",
+                    f"[sms-test] No recent candidate messages "
+                    f"(looked back {config.since_seconds}s)",
                     file=sys.stderr,
                     flush=True,
                 )
-            
+
             if candidates:
                 candidates.sort(key=lambda item: item[0], reverse=True)
-                _, code, text, service = candidates[0]
+                _, code, _preview, _service = candidates[0]
                 print(
                     f"[sms-test] ✓ Extracted code '{code}' from latest message",
                     file=sys.stderr,
@@ -135,7 +216,7 @@ def poll_for_code_from_messages(config: MessageConfig) -> str:
                 print(code)
                 conn.close()
                 return code
-            
+
             conn.close()
 
         except sqlite3.OperationalError as e:
