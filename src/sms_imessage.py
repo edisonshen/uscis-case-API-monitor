@@ -144,6 +144,18 @@ def poll_for_code_from_messages(config: MessageConfig) -> str:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
+            # Force any pending Messages.app writes in chat.db-wal to merge
+            # into the main DB so this reader's snapshot includes them. The
+            # default auto-checkpoint threshold (1000 pages, ~1MB) sometimes
+            # lags by minutes when the Mac is coming out of sleep, hiding
+            # fresh USCIS verification SMS from us mid-poll. PASSIVE never
+            # blocks Messages.app's writer; if it's mid-write the checkpoint
+            # is a no-op and we still pick up the row on the next iteration.
+            try:
+                cursor.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            except sqlite3.OperationalError:
+                pass
+
             # Query messages that *might* carry an OTP. Two routes:
             #   (1) m.text LIKE keyword  — fast path on macOS <13 and on rows
             #       where iMessage still populates the text column.
