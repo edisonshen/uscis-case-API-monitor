@@ -357,6 +357,24 @@ async function maybeHandleOtp(page, config) {
       throw new Error("OTP configuration not found");
     }
     
+    // Force-wake Messages.app so iMessage Continuity starts syncing from the
+    // iPhone before the Python OTP poll opens chat.db. m.date in chat.db is
+    // the SMS origin time, not the local insert time — if Messages.app is
+    // suspended, the row can be missing from chat.db for hours.
+    if (mode === "sms-imessage") {
+      console.log("  Force-waking Messages.app for iMessage Continuity sync...");
+      try {
+        await new Promise((resolve) => {
+          const child = spawn("open", ["-g", "-a", "Messages"], { stdio: "ignore" });
+          child.on("close", () => resolve());
+          child.on("error", () => resolve());
+        });
+        await page.waitForTimeout(2000);
+      } catch {
+        // best-effort — if anything goes wrong, fall through to the poll
+      }
+    }
+
     console.log(`  Reading OTP code from ${modeLabel}...`);
     const rawCode = await readOtp(config.otp);
     const code = normalizeOtp(rawCode);
