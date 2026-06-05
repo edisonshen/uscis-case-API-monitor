@@ -49,17 +49,37 @@ def checkpoint_wal(cursor: sqlite3.Cursor) -> None:
 
     Tries a ``TRUNCATE`` checkpoint first — it folds the WAL back into the
     main database and truncates the WAL file, which is the strongest pull of
-    not-yet-merged rows. If Messages.app's writer is mid-write (or the DB is
-    not in WAL mode) SQLite raises ``OperationalError``; we fall back to a
-    ``PASSIVE`` checkpoint, which never blocks the writer. If PASSIVE also
-    raises, we swallow it — the row will be picked up on a later poll
-    iteration once the auto-checkpoint catches up.
+    not-yet-merged rows.
+
+    A checkpoint can fail two ways, and we must handle BOTH or the fallback is
+    skipped exactly in the contention case this helper targets:
+      * SQLite raises ``OperationalError`` (e.g. WAL mode not enabled).
+      * ``PRAGMA wal_checkpoint`` returns a result row ``(busy, log,
+        checkpointed)`` where ``busy == 1`` — TRUNCATE could not grab the
+        write lock because Messages.app's writer is mid-write. This does NOT
+        raise; we must inspect the row.
+    On either TRUNCATE failure we fall back to a ``PASSIVE`` checkpoint, which
+    never blocks the writer and folds whatever WAL pages it can. PASSIVE is
+    the best-effort floor: if it too is busy or raises, we swallow it — the
+    row will be picked up on a later poll once auto-checkpoint catches up.
     """
-    try:
-        cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-    except sqlite3.OperationalError:
+
+    def _busy(result) -> bool:
+        # Row shape is (busy, log_pages, checkpointed_pages); busy==1 means
+        # the checkpoint could not acquire the lock and did nothing useful.
         try:
-            cursor.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            return bool(result and result[0] == 1)
+        except (TypeError, IndexError):
+            return False
+
+    try:
+        truncate_busy = _busy(cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone())
+    except sqlite3.OperationalError:
+        truncate_busy = True
+
+    if truncate_busy:
+        try:
+            cursor.execute("PRAGMA wal_checkpoint(PASSIVE);").fetchone()
         except sqlite3.OperationalError:
             pass
 

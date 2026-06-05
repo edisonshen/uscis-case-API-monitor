@@ -112,20 +112,47 @@ def test_keywords_are_lowercase_tuple() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _FakeCursor:
-    """Records the checkpoint PRAGMAs executed and can be told which modes
-    raise ``OperationalError`` so we can simulate a TRUNCATE that the busy
-    Messages.app writer refuses."""
+class _FakeResult:
+    """Stand-in for the cursor object ``Cursor.execute`` returns; supports the
+    ``.fetchone()`` checkpoint_wal calls to read the ``(busy, log, ckpt)`` row."""
 
-    def __init__(self, fail_modes: tuple[str, ...] = ()) -> None:
+    def __init__(self, row) -> None:
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+# A successful checkpoint returns (busy=0, log, checkpointed); a contended one
+# returns (busy=1, -1, -1) WITHOUT raising.
+_OK_ROW = (0, 5, 5)
+_BUSY_ROW = (1, -1, -1)
+
+
+class _FakeCursor:
+    """Records the checkpoint PRAGMAs executed. ``fail_modes`` makes a mode
+    raise ``OperationalError``; ``busy_modes`` makes a mode return a busy
+    result row (busy==1) instead of raising — the contention path that the
+    earlier OperationalError-only handler silently skipped."""
+
+    def __init__(
+        self,
+        fail_modes: tuple[str, ...] = (),
+        busy_modes: tuple[str, ...] = (),
+    ) -> None:
         self.calls: list[str] = []
         self._fail_modes = fail_modes
+        self._busy_modes = busy_modes
 
-    def execute(self, sql: str) -> None:
+    def execute(self, sql: str) -> _FakeResult:
         self.calls.append(sql)
         for mode in self._fail_modes:
             if mode in sql:
                 raise sqlite3.OperationalError(f"database is locked ({mode})")
+        for mode in self._busy_modes:
+            if mode in sql:
+                return _FakeResult(_BUSY_ROW)
+        return _FakeResult(_OK_ROW)
 
 
 def test_checkpoint_truncate_succeeds_no_fallback() -> None:
@@ -143,10 +170,36 @@ def test_checkpoint_falls_back_to_passive_on_truncate_error() -> None:
     assert any("PASSIVE" in c for c in cur.calls)
 
 
+def test_checkpoint_falls_back_to_passive_on_truncate_busy_row() -> None:
+    # Regression (codex P2): a busy TRUNCATE returns (busy=1, ...) WITHOUT
+    # raising. The PASSIVE fallback must still fire — this is exactly the
+    # contention case the helper exists for.
+    cur = _FakeCursor(busy_modes=("TRUNCATE",))
+    checkpoint_wal(cur)
+    assert any("TRUNCATE" in c for c in cur.calls)
+    assert any("PASSIVE" in c for c in cur.calls)
+
+
+def test_checkpoint_no_fallback_when_truncate_not_busy() -> None:
+    # A clean TRUNCATE (busy=0) must NOT trigger a redundant PASSIVE call.
+    cur = _FakeCursor()
+    checkpoint_wal(cur)
+    assert not any("PASSIVE" in c for c in cur.calls)
+
+
 def test_checkpoint_swallows_passive_error_too() -> None:
     # Both modes fail (e.g. WAL not enabled): checkpoint_wal must still not
     # raise — it is best-effort and must never block the poll.
     cur = _FakeCursor(fail_modes=("TRUNCATE", "PASSIVE"))
+    checkpoint_wal(cur)
+    assert any("TRUNCATE" in c for c in cur.calls)
+    assert any("PASSIVE" in c for c in cur.calls)
+
+
+def test_checkpoint_busy_truncate_then_busy_passive_no_raise() -> None:
+    # Both checkpoints return busy rows (no exceptions): must not raise and
+    # must have attempted both — PASSIVE is the best-effort floor.
+    cur = _FakeCursor(busy_modes=("TRUNCATE", "PASSIVE"))
     checkpoint_wal(cur)
     assert any("TRUNCATE" in c for c in cur.calls)
     assert any("PASSIVE" in c for c in cur.calls)
