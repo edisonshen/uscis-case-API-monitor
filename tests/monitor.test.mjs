@@ -165,6 +165,47 @@ test("burst performs exactly maxRetries fast-retries then exhausts", () => {
   assert.equal(exhaustedAt, CFG.maxRetries);
 });
 
+// Regression (codex P2): a late-day OTP failure whose 15-min retry would wake
+// AFTER 8pm ET must not schedule a dead retry — it exhausts (and notifies)
+// instead of silently resetting the burst when the after-hours run is skipped.
+test("OTP failure exhausts (no retry) when the retry would land after hours", () => {
+  const out = decideNextDelay({
+    error: otpError(),
+    retryCount: 0,
+    withinSchedule: true, // the failed run was in-window
+    retryWithinSchedule: false, // but the 15-min retry target is after hours
+    cfg: CFG,
+    fallbackDelayMs: FALLBACK,
+  });
+  assert.equal(out.delayMs, FALLBACK);
+  assert.equal(out.isRetry, false);
+  assert.equal(out.exhausted, true);
+});
+
+test("OTP failure still retries when the retry target is in-window", () => {
+  const out = decideNextDelay({
+    error: otpError(),
+    retryCount: 0,
+    withinSchedule: true,
+    retryWithinSchedule: true,
+    cfg: CFG,
+    fallbackDelayMs: FALLBACK,
+  });
+  assert.equal(out.isRetry, true);
+  assert.equal(out.exhausted, false);
+});
+
+test("retryWithinSchedule defaults to true (backward-compatible)", () => {
+  const out = decideNextDelay({
+    error: otpError(),
+    retryCount: 0,
+    withinSchedule: true,
+    cfg: CFG,
+    fallbackDelayMs: FALLBACK,
+  });
+  assert.equal(out.isRetry, true);
+});
+
 // Regression (codex P1): a failed OTP can strand the browser on a USCIS
 // verification page. The login() guard treats `otpFailed && verification URL`
 // as an OTP login failure (so it is NOT saved as success and the scheduler

@@ -1118,26 +1118,46 @@ const DEFAULT_OTP_RETRY = { maxRetries: 8, retryIntervalMinutes: 15 };
 // result of `nextScheduledRun()`) so this function — and its tests — stay
 // deterministic.
 //
-//   OTP failure, in-window, retryCount < maxRetries -> retry in N minutes
-//   OTP failure, retryCount >= maxRetries           -> fallback, exhausted
-//   OTP failure, out of window                      -> fallback (no retry)
-//   success or non-OTP error                        -> fallback (no retry)
-function decideNextDelay({ error, retryCount, withinSchedule, cfg, fallbackDelayMs }) {
+//   OTP failure, in-window, budget left, retry lands in-window -> retry in N min
+//   OTP failure, budget exhausted                              -> fallback, exhausted
+//   OTP failure, retry would land AFTER hours                  -> fallback, exhausted (notify)
+//   OTP failure, the failed run itself was out of window       -> fallback (no retry)
+//   success or non-OTP error                                   -> fallback (no retry)
+//
+// `withinSchedule` describes the run that just failed; `retryWithinSchedule`
+// describes whether the PROJECTED retry target time (now + retry interval) is
+// still inside the 9am–8pm ET window. A late-day OTP failure whose retry would
+// wake after hours must NOT schedule a dead retry (it would skip the check and
+// reset the burst silently — the 2026-06-05 silence bug). Instead we exhaust:
+// fall back to nextScheduledRun() AND fire the operator notice.
+function decideNextDelay({
+  error,
+  retryCount,
+  withinSchedule,
+  retryWithinSchedule = true,
+  cfg,
+  fallbackDelayMs,
+}) {
   const { maxRetries, retryIntervalMinutes } = { ...DEFAULT_OTP_RETRY, ...(cfg || {}) };
   const isOtpFailure = error?.code === "OTP_LOGIN_FAILED";
 
-  if (isOtpFailure && withinSchedule && retryCount < maxRetries) {
+  if (isOtpFailure && withinSchedule) {
+    if (retryCount >= maxRetries) {
+      return { delayMs: fallbackDelayMs, isRetry: false, exhausted: true };
+    }
+    if (!retryWithinSchedule) {
+      // Budget remains but the retry would wake after hours — fall back and
+      // notify rather than schedule a retry that silently skips the check.
+      return { delayMs: fallbackDelayMs, isRetry: false, exhausted: true };
+    }
     return { delayMs: retryIntervalMinutes * 60 * 1000, isRetry: true, exhausted: false };
-  }
-  if (isOtpFailure && withinSchedule && retryCount >= maxRetries) {
-    return { delayMs: fallbackDelayMs, isRetry: false, exhausted: true };
   }
   return { delayMs: fallbackDelayMs, isRetry: false, exhausted: false };
 }
 
-function isWithinSchedule() {
-  // Check if current time is within ET weekday 9am-8pm
-  const now = new Date();
+function isWithinSchedule(when = new Date()) {
+  // Check if `when` (default: now) is within ET weekday 9am-8pm
+  const now = when;
   const etStr = now.toLocaleString("en-US", { timeZone: "America/New_York" });
   const et = new Date(etStr);
   const day = et.getDay(); // 0=Sun, 6=Sat
@@ -1234,10 +1254,18 @@ async function runScheduler(config) {
     // budget remains, so the failure earns another retry; ===maxRetries means
     // all `maxRetries` retries have run -> exhausted. We bump the counter
     // below only when the decision is actually a retry.
+    // Would a 15-min fast-retry still land inside the 9am–8pm ET window? If
+    // the failure happens late in the day, the retry target is after hours and
+    // must NOT be scheduled (it would skip the check and silently reset the
+    // burst). decideNextDelay turns that into an exhaustion + operator notice.
+    const retryTarget = new Date(Date.now() + otpCfg.retryIntervalMinutes * 60 * 1000);
+    const retryWithinSchedule = isWithinSchedule(retryTarget);
+
     const decision = decideNextDelay({
       error: runError,
       retryCount: otpRetryCount,
       withinSchedule,
+      retryWithinSchedule,
       cfg: otpCfg,
       fallbackDelayMs: nextScheduledRun(),
     });
@@ -1273,8 +1301,12 @@ async function notifyOtpExhausted(config, attempts) {
   const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
   if (!webhookUrl) return;
   const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+  // `attempts` is the number of fast-retries fired (0 when a late-day failure
+  // exhausts immediately because the retry would land after hours). Clamp to
+  // >=1 so the message never reads "after 0 tries".
+  const n = Math.max(attempts, 1);
   await sendDiscordWebhook(webhookUrl, {
-    content: `❌ \`${ts} UTC\` couldn't read OTP after ${attempts} tries — falling back to the 6h schedule.`,
+    content: `❌ \`${ts} UTC\` couldn't read OTP after ${n} ${n === 1 ? "try" : "tries"} — falling back to the 6h schedule.`,
   }).catch((err) => console.error(`  ✗ OTP-exhaustion notification failed: ${err.message}`));
 }
 
