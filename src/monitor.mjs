@@ -570,6 +570,13 @@ async function login(config) {
       
       if (otpInput) {
         console.log("✓ OTP input found, proceeding with OTP handling...");
+        // The OTP page appeared, so this login depends on the verification
+        // code. Pre-arm the OTP-failure tag: if the login does NOT stick
+        // below, treat it as an OTP failure (fast-retry) regardless of
+        // whether maybeHandleOtp threw or returned true via its
+        // "may still be processing" path (code read but page rejected it).
+        // On a successful login no error is thrown, so the flag is moot.
+        otpFailed = true;
         const handledOtp = await maybeHandleOtp(page, config);
         if (handledOtp) {
           console.log("✓ OTP submitted");
@@ -582,9 +589,10 @@ async function login(config) {
       }
     } catch (otpError) {
       // The OTP could not be read/submitted (most often: the code never
-      // landed in chat.db within the poll window). Tag it so the
-      // "Login did not stick" throw below carries OTP_LOGIN_FAILED and the
-      // scheduler fast-retries with a fresh code instead of waiting 6h.
+      // landed in chat.db within the poll window). otpFailed was already set
+      // when the OTP page appeared; keep it set here so the "Login did not
+      // stick" throw below carries OTP_LOGIN_FAILED and the scheduler
+      // fast-retries with a fresh code instead of waiting 6h.
       otpFailed = true;
       console.error(`⚠️  OTP handling error (continuing): ${otpError.message}`);
       await writeDebugSnapshot(page, "otp-error");
@@ -1211,13 +1219,12 @@ async function runScheduler(config) {
       console.log(`⏸️  Outside schedule (${etStr} ET). Skipping.`);
     }
 
-    // An OTP-not-stick failure consumes one retry slot. The decision below
-    // reads the *post-increment* count so retryCount===maxRetries trips the
-    // exhausted branch on the final (Nth) failure.
-    if (runError?.code === "OTP_LOGIN_FAILED") {
-      otpRetryCount += 1;
-    }
-
+    // otpRetryCount = number of fast-retries already SCHEDULED in this burst
+    // (the initial 9:00 scheduled run is not itself a retry). Pass the
+    // pre-increment count to the pure decision: retryCount<maxRetries means
+    // budget remains, so the failure earns another retry; ===maxRetries means
+    // all `maxRetries` retries have run -> exhausted. We bump the counter
+    // below only when the decision is actually a retry.
     const decision = decideNextDelay({
       error: runError,
       retryCount: otpRetryCount,
@@ -1230,7 +1237,10 @@ async function runScheduler(config) {
       console.error(`❌ OTP fast-retry exhausted after ${otpRetryCount} attempts`);
       await notifyOtpExhausted(config, otpRetryCount);
       otpRetryCount = 0;
-    } else if (!decision.isRetry) {
+    } else if (decision.isRetry) {
+      // Scheduling another fast-retry — consume one budget slot.
+      otpRetryCount += 1;
+    } else {
       // Success or non-OTP path — clear any in-progress retry burst.
       otpRetryCount = 0;
     }

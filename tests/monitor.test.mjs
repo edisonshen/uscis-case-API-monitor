@@ -124,3 +124,39 @@ test("missing cfg falls back to DEFAULT_OTP_RETRY", () => {
   assert.equal(out.delayMs, DEFAULT_OTP_RETRY.retryIntervalMinutes * 60 * 1000);
   assert.equal(out.isRetry, true);
 });
+
+// Regression: the scheduler must perform exactly `maxRetries` fast-retries
+// after the initial scheduled failure, then exhaust — NOT one short. This
+// replays the scheduler's burst loop (pre-increment count -> decide -> bump
+// only on isRetry) deterministically, with no timers. Guards the off-by-one
+// where the initial failure wrongly consumed a retry slot (codex P2).
+test("burst performs exactly maxRetries fast-retries then exhausts", () => {
+  let count = 0; // fast-retries already scheduled (mirrors otpRetryCount)
+  const retryDelays = [];
+  let exhaustedAt = null;
+
+  // The initial scheduled failure + each subsequent retry failure. Cap the
+  // loop well above maxRetries so a runaway (never-exhaust) bug fails the test.
+  for (let attempt = 0; attempt < CFG.maxRetries + 5; attempt += 1) {
+    const out = decideNextDelay({
+      error: otpError(),
+      retryCount: count,
+      withinSchedule: true,
+      cfg: CFG,
+      fallbackDelayMs: FALLBACK,
+    });
+    if (out.exhausted) {
+      exhaustedAt = count;
+      break;
+    }
+    assert.equal(out.isRetry, true);
+    retryDelays.push(out.delayMs);
+    count += 1;
+  }
+
+  // Exactly 8 fast-retries fired (retry #1..#8), each at the 15-min interval.
+  assert.equal(retryDelays.length, CFG.maxRetries);
+  for (const d of retryDelays) assert.equal(d, CFG.retryIntervalMinutes * 60 * 1000);
+  // The 9th OTP failure (after the budget is spent) exhausts.
+  assert.equal(exhaustedAt, CFG.maxRetries);
+});
