@@ -12,8 +12,11 @@ import re
 
 import pytest
 
+import sqlite3
+
 from sms_imessage import (
     OTP_KEYWORDS,
+    checkpoint_wal,
     extract_code_from_row,
     extract_printable_runs,
 )
@@ -102,3 +105,48 @@ def test_keywords_are_lowercase_tuple() -> None:
     assert all(kw == kw.lower() for kw in OTP_KEYWORDS)
     assert "verification" in OTP_KEYWORDS
     assert "uscis" in OTP_KEYWORDS
+
+
+# ---------------------------------------------------------------------------
+# checkpoint_wal — TRUNCATE-first, PASSIVE fallback, never raises
+# ---------------------------------------------------------------------------
+
+
+class _FakeCursor:
+    """Records the checkpoint PRAGMAs executed and can be told which modes
+    raise ``OperationalError`` so we can simulate a TRUNCATE that the busy
+    Messages.app writer refuses."""
+
+    def __init__(self, fail_modes: tuple[str, ...] = ()) -> None:
+        self.calls: list[str] = []
+        self._fail_modes = fail_modes
+
+    def execute(self, sql: str) -> None:
+        self.calls.append(sql)
+        for mode in self._fail_modes:
+            if mode in sql:
+                raise sqlite3.OperationalError(f"database is locked ({mode})")
+
+
+def test_checkpoint_truncate_succeeds_no_fallback() -> None:
+    cur = _FakeCursor()
+    checkpoint_wal(cur)
+    assert len(cur.calls) == 1
+    assert "TRUNCATE" in cur.calls[0]
+
+
+def test_checkpoint_falls_back_to_passive_on_truncate_error() -> None:
+    cur = _FakeCursor(fail_modes=("TRUNCATE",))
+    # Must not raise: TRUNCATE fails, PASSIVE is attempted as the fallback.
+    checkpoint_wal(cur)
+    assert any("TRUNCATE" in c for c in cur.calls)
+    assert any("PASSIVE" in c for c in cur.calls)
+
+
+def test_checkpoint_swallows_passive_error_too() -> None:
+    # Both modes fail (e.g. WAL not enabled): checkpoint_wal must still not
+    # raise — it is best-effort and must never block the poll.
+    cur = _FakeCursor(fail_modes=("TRUNCATE", "PASSIVE"))
+    checkpoint_wal(cur)
+    assert any("TRUNCATE" in c for c in cur.calls)
+    assert any("PASSIVE" in c for c in cur.calls)
