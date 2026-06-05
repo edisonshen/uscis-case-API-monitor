@@ -338,6 +338,32 @@ async function writeDebugSnapshot(page, label) {
   return base;
 }
 
+// Force-wake Messages.app HARD so iMessage Continuity flushes the relayed
+// USCIS SMS into chat.db before the Python poller reads it. A backgrounded
+// `open -g -a Messages` proved too weak (2026-06-05 incident: imagent
+// deferred the disk write ~2.5h on an awake Mac). Instead:
+//   1. osascript activate  — foreground the app so it un-naps
+//   2. killall -CONT Messages imagent — resume any App-Nap-suspended process
+// All steps are best-effort: errors are swallowed, the function never throws.
+async function wakeMessages() {
+  const spawnQuiet = (cmd, args) =>
+    new Promise((resolve) => {
+      try {
+        const child = spawn(cmd, args, { stdio: "ignore" });
+        child.on("close", () => resolve());
+        child.on("error", () => resolve());
+      } catch {
+        resolve();
+      }
+    });
+
+  await spawnQuiet("osascript", ["-e", 'tell application "Messages" to activate']);
+  // -CONT resumes any App-Nap-suspended Messages/imagent process. These exit
+  // non-zero when the process is not running; stdio:"ignore" + the error
+  // handler keep that quiet.
+  await spawnQuiet("killall", ["-CONT", "Messages", "imagent"]);
+}
+
 async function maybeHandleOtp(page, config) {
   console.log("  Finding OTP input field...");
   const otpInput = page.locator(OTP_INPUT_SELECTORS.join(", ")).first();
@@ -362,17 +388,9 @@ async function maybeHandleOtp(page, config) {
     // the SMS origin time, not the local insert time — if Messages.app is
     // suspended, the row can be missing from chat.db for hours.
     if (mode === "sms-imessage") {
-      console.log("  Force-waking Messages.app for iMessage Continuity sync...");
-      try {
-        await new Promise((resolve) => {
-          const child = spawn("open", ["-g", "-a", "Messages"], { stdio: "ignore" });
-          child.on("close", () => resolve());
-          child.on("error", () => resolve());
-        });
-        await page.waitForTimeout(2000);
-      } catch {
-        // best-effort — if anything goes wrong, fall through to the poll
-      }
+      console.log("  Force-waking Messages.app (hard) for iMessage Continuity sync...");
+      await wakeMessages();
+      await page.waitForTimeout(2000);
     }
 
     console.log(`  Reading OTP code from ${modeLabel}...`);
@@ -508,6 +526,10 @@ async function browserWithState(useSavedState) {
 
 async function login(config) {
   const { browser, context, page } = await browserWithState(false);
+  // Set true if the OTP step failed (read timeout / OTP error). Used to tag
+  // the "Login did not stick" throw with code OTP_LOGIN_FAILED so the
+  // scheduler can fast-retry instead of waiting 6h.
+  let otpFailed = false;
   try {
     console.log("Starting login process...");
     console.log(`Navigating to ${config.loginUrl}`);
@@ -524,6 +546,14 @@ async function login(config) {
     
     await writeDebugSnapshot(page, "login-form-filled");
     console.log("✓ Login form filled");
+
+    // Wake Messages.app BEFORE submitting so iMessage Continuity is already
+    // syncing by the time USCIS texts the code — shrinks the relay write lag
+    // that otherwise hides the SMS from chat.db for minutes/hours.
+    if ((config.otp?.mode || "imap") === "sms-imessage") {
+      console.log("Pre-waking Messages.app before submit...");
+      await wakeMessages();
+    }
 
     console.log("Submitting login form...");
     await submitLogin(page);
@@ -551,6 +581,11 @@ async function login(config) {
         console.log("No OTP input found - proceeding without OTP");
       }
     } catch (otpError) {
+      // The OTP could not be read/submitted (most often: the code never
+      // landed in chat.db within the poll window). Tag it so the
+      // "Login did not stick" throw below carries OTP_LOGIN_FAILED and the
+      // scheduler fast-retries with a fresh code instead of waiting 6h.
+      otpFailed = true;
       console.error(`⚠️  OTP handling error (continuing): ${otpError.message}`);
       await writeDebugSnapshot(page, "otp-error");
     }
@@ -566,9 +601,15 @@ async function login(config) {
     if (await looksLoggedOut(page)) {
       const summary = await pageSummary(page);
       await writeDebugSnapshot(page, "login-failed");
-      throw new Error(
+      const err = new Error(
         `Login did not stick. URL: ${summary.url}\nTitle: ${summary.title}\nHeading: ${summary.heading}\nAlert: ${summary.alert}\nText: ${summary.text.slice(0, 300)}`,
       );
+      // If the login failed specifically because the OTP step failed, tag it
+      // so the scheduler fast-retries (15 min) instead of falling back to 6h.
+      if (otpFailed) {
+        err.code = "OTP_LOGIN_FAILED";
+      }
+      throw err;
     }
     
     console.log("✓ Successfully logged in!");
@@ -1049,6 +1090,34 @@ async function poll(config) {
 
 // --- Scheduler ---
 
+// Defaults for the OTP fast-retry loop. Overridable via the `otpRetry` block
+// in config.local.json. See docs/DESIGN-otp-timeout-fast-retry.md.
+const DEFAULT_OTP_RETRY = { maxRetries: 8, retryIntervalMinutes: 15 };
+
+// Pure scheduler decision: given the just-finished run's outcome, decide how
+// long to wait before the next run and whether this is a fast OTP retry.
+//
+// PURE — no timers, no Date, no I/O. The caller passes `fallbackDelayMs` (the
+// result of `nextScheduledRun()`) so this function — and its tests — stay
+// deterministic.
+//
+//   OTP failure, in-window, retryCount < maxRetries -> retry in N minutes
+//   OTP failure, retryCount >= maxRetries           -> fallback, exhausted
+//   OTP failure, out of window                      -> fallback (no retry)
+//   success or non-OTP error                        -> fallback (no retry)
+function decideNextDelay({ error, retryCount, withinSchedule, cfg, fallbackDelayMs }) {
+  const { maxRetries, retryIntervalMinutes } = { ...DEFAULT_OTP_RETRY, ...(cfg || {}) };
+  const isOtpFailure = error?.code === "OTP_LOGIN_FAILED";
+
+  if (isOtpFailure && withinSchedule && retryCount < maxRetries) {
+    return { delayMs: retryIntervalMinutes * 60 * 1000, isRetry: true, exhausted: false };
+  }
+  if (isOtpFailure && withinSchedule && retryCount >= maxRetries) {
+    return { delayMs: fallbackDelayMs, isRetry: false, exhausted: true };
+  }
+  return { delayMs: fallbackDelayMs, isRetry: false, exhausted: false };
+}
+
 function isWithinSchedule() {
   // Check if current time is within ET weekday 9am-8pm
   const now = new Date();
@@ -1122,26 +1191,72 @@ async function runScheduler(config) {
   console.log("   Schedule: Weekdays 9am–8pm ET, every 6 hours");
   console.log("   Press Ctrl+C to stop\n");
   
+  const otpCfg = { ...DEFAULT_OTP_RETRY, ...(config.otpRetry || {}) };
+  // Counts consecutive OTP-not-stick failures in the current fast-retry
+  // burst. Reset to 0 on any success or on exhaustion.
+  let otpRetryCount = 0;
+
   const run = async () => {
-    if (isWithinSchedule()) {
+    let runError = null;
+    const withinSchedule = isWithinSchedule();
+    if (withinSchedule) {
       try {
         await scheduledCheck(config);
       } catch (error) {
+        runError = error;
         console.error(`❌ Scheduled check error: ${error.message}`);
       }
     } else {
       const etStr = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
       console.log(`⏸️  Outside schedule (${etStr} ET). Skipping.`);
     }
-    
-    const waitMs = nextScheduledRun();
-    const waitMin = Math.round(waitMs / 60000);
-    console.log(`⏳ Next check in ${waitMin} minutes\n`);
-    setTimeout(run, waitMs);
+
+    // An OTP-not-stick failure consumes one retry slot. The decision below
+    // reads the *post-increment* count so retryCount===maxRetries trips the
+    // exhausted branch on the final (Nth) failure.
+    if (runError?.code === "OTP_LOGIN_FAILED") {
+      otpRetryCount += 1;
+    }
+
+    const decision = decideNextDelay({
+      error: runError,
+      retryCount: otpRetryCount,
+      withinSchedule,
+      cfg: otpCfg,
+      fallbackDelayMs: nextScheduledRun(),
+    });
+
+    if (decision.exhausted) {
+      console.error(`❌ OTP fast-retry exhausted after ${otpRetryCount} attempts`);
+      await notifyOtpExhausted(config, otpRetryCount);
+      otpRetryCount = 0;
+    } else if (!decision.isRetry) {
+      // Success or non-OTP path — clear any in-progress retry burst.
+      otpRetryCount = 0;
+    }
+
+    const waitMin = Math.round(decision.delayMs / 60000);
+    if (decision.isRetry) {
+      console.log(`🔁 OTP fast-retry ${otpRetryCount}/${otpCfg.maxRetries} — next attempt in ${waitMin} minutes\n`);
+    } else {
+      console.log(`⏳ Next check in ${waitMin} minutes\n`);
+    }
+    setTimeout(run, decision.delayMs);
   };
-  
+
   // Run immediately on start
   await run();
+}
+
+// Send a single Discord notice when the OTP fast-retry loop gives up, so the
+// operator sees the failure instead of silence (the 2026-06-05 failure mode).
+async function notifyOtpExhausted(config, attempts) {
+  const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
+  if (!webhookUrl) return;
+  const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+  await sendDiscordWebhook(webhookUrl, {
+    content: `❌ \`${ts} UTC\` couldn't read OTP after ${attempts} tries — falling back to the 6h schedule.`,
+  }).catch((err) => console.error(`  ✗ OTP-exhaustion notification failed: ${err.message}`));
 }
 
 async function smsTest() {
@@ -1273,7 +1388,24 @@ async function main() {
   throw new Error(`Unknown command: ${command}`);
 }
 
-main().catch((error) => {
-  console.error(error.message);
-  process.exit(1);
-});
+// Exported for unit tests (tests/monitor.test.mjs). decideNextDelay is pure.
+export { decideNextDelay, DEFAULT_OTP_RETRY };
+
+// Only run the CLI when invoked directly (`node src/monitor.mjs ...`), not
+// when imported by the test runner. import.meta.url vs argv[1] is the
+// standard ESM "is this the entry module" check.
+const isEntry = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return import.meta.url === new URL(`file://${path.resolve(process.argv[1])}`).href;
+  } catch {
+    return false;
+  }
+})();
+
+if (isEntry) {
+  main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+  });
+}

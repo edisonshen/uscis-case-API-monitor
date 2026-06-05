@@ -13,6 +13,10 @@
   "contentSelector": "body",
   "postLoginWaitMs": 5000,
   "otpWaitTimeoutMs": 30000,
+  "otpRetry": {
+    "maxRetries": 8,
+    "retryIntervalMinutes": 15
+  },
   "otp": {
     "mode": "sms-imessage",
     "timeoutSeconds": 180,

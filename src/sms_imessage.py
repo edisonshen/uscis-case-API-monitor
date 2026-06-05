@@ -43,6 +43,27 @@ def parse_args() -> MessageConfig:
     )
 
 
+def checkpoint_wal(cursor: sqlite3.Cursor) -> None:
+    """Force pending Messages.app writes in ``chat.db-wal`` into the main DB
+    so this reader's snapshot includes them. Best-effort: NEVER raises.
+
+    Tries a ``TRUNCATE`` checkpoint first — it folds the WAL back into the
+    main database and truncates the WAL file, which is the strongest pull of
+    not-yet-merged rows. If Messages.app's writer is mid-write (or the DB is
+    not in WAL mode) SQLite raises ``OperationalError``; we fall back to a
+    ``PASSIVE`` checkpoint, which never blocks the writer. If PASSIVE also
+    raises, we swallow it — the row will be picked up on a later poll
+    iteration once the auto-checkpoint catches up.
+    """
+    try:
+        cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    except sqlite3.OperationalError:
+        try:
+            cursor.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        except sqlite3.OperationalError:
+            pass
+
+
 def get_messages_db_path() -> str | None:
     """Get the path to macOS Messages database."""
     db_path = Path.home() / "Library" / "Messages" / "chat.db"
@@ -147,14 +168,12 @@ def poll_for_code_from_messages(config: MessageConfig) -> str:
             # Force any pending Messages.app writes in chat.db-wal to merge
             # into the main DB so this reader's snapshot includes them. The
             # default auto-checkpoint threshold (1000 pages, ~1MB) sometimes
-            # lags by minutes when the Mac is coming out of sleep, hiding
-            # fresh USCIS verification SMS from us mid-poll. PASSIVE never
-            # blocks Messages.app's writer; if it's mid-write the checkpoint
-            # is a no-op and we still pick up the row on the next iteration.
-            try:
-                cursor.execute("PRAGMA wal_checkpoint(PASSIVE);")
-            except sqlite3.OperationalError:
-                pass
+            # lags by minutes — or hours, when imagent defers the relay write
+            # on an awake Mac (see 2026-06-05 incident) — hiding fresh USCIS
+            # verification SMS from us mid-poll. checkpoint_wal tries the
+            # strong TRUNCATE checkpoint and falls back to PASSIVE; it never
+            # blocks Messages.app's writer and never raises.
+            checkpoint_wal(cursor)
 
             # Query messages that *might* carry an OTP. Two routes:
             #   (1) m.text LIKE keyword  — fast path on macOS <13 and on rows
