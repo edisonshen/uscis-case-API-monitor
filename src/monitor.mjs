@@ -606,7 +606,16 @@ async function login(config) {
     await page.waitForTimeout(3000);
     
     console.log("Checking if logged in successfully...");
-    if (await looksLoggedOut(page)) {
+    // A failed/timed-out OTP can leave the browser stranded on the USCIS
+    // verification page instead of the login form. looksLoggedOut() returns
+    // FALSE for a verification URL (it is not the login page), so without this
+    // guard we would fall through and storageState() the unauthenticated
+    // verification session as if login succeeded — and never tag the OTP
+    // failure, so the scheduler would skip the fast-retry. If the OTP step
+    // failed and we are still sitting on a verification page, that is an OTP
+    // login failure: throw it tagged so the scheduler fast-retries.
+    const stuckOnVerification = otpFailed && isVerificationPageUrl(page.url());
+    if ((await looksLoggedOut(page)) || stuckOnVerification) {
       const summary = await pageSummary(page);
       await writeDebugSnapshot(page, "login-failed");
       const err = new Error(
@@ -1398,8 +1407,8 @@ async function main() {
   throw new Error(`Unknown command: ${command}`);
 }
 
-// Exported for unit tests (tests/monitor.test.mjs). decideNextDelay is pure.
-export { decideNextDelay, DEFAULT_OTP_RETRY };
+// Exported for unit tests (tests/monitor.test.mjs). All pure.
+export { decideNextDelay, DEFAULT_OTP_RETRY, isVerificationPageUrl };
 
 // Only run the CLI when invoked directly (`node src/monitor.mjs ...`), not
 // when imported by the test runner. import.meta.url vs argv[1] is the

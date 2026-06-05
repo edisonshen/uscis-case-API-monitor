@@ -146,6 +146,11 @@ class _FakeCursor:
 
     def execute(self, sql: str) -> _FakeResult:
         self.calls.append(sql)
+        # busy_timeout read returns the current value; set/restore are no-ops.
+        if "busy_timeout" in sql:
+            if "=" in sql:
+                return _FakeResult(None)
+            return _FakeResult((5000,))
         for mode in self._fail_modes:
             if mode in sql:
                 raise sqlite3.OperationalError(f"database is locked ({mode})")
@@ -155,11 +160,34 @@ class _FakeCursor:
         return _FakeResult(_OK_ROW)
 
 
+def _checkpoint_calls(cur: "_FakeCursor") -> list[str]:
+    return [c for c in cur.calls if "wal_checkpoint" in c]
+
+
 def test_checkpoint_truncate_succeeds_no_fallback() -> None:
     cur = _FakeCursor()
     checkpoint_wal(cur)
-    assert len(cur.calls) == 1
-    assert "TRUNCATE" in cur.calls[0]
+    ckpts = _checkpoint_calls(cur)
+    assert len(ckpts) == 1
+    assert "TRUNCATE" in ckpts[0]
+
+
+def test_checkpoint_zeroes_then_restores_busy_timeout() -> None:
+    # Regression (codex P2): the checkpoints must run non-blocking. Verify the
+    # busy timeout is set to 0 before the checkpoint and restored afterwards so
+    # a contended checkpoint returns immediately instead of stalling the poll.
+    cur = _FakeCursor()
+    checkpoint_wal(cur)
+    assert "PRAGMA busy_timeout=0;" in cur.calls
+    # The zero must come before the TRUNCATE checkpoint.
+    assert cur.calls.index("PRAGMA busy_timeout=0;") < cur.calls.index(
+        next(c for c in cur.calls if "TRUNCATE" in c)
+    )
+    # And the prior value (5000) is restored after.
+    assert "PRAGMA busy_timeout=5000;" in cur.calls
+    assert cur.calls.index("PRAGMA busy_timeout=5000;") > cur.calls.index(
+        next(c for c in cur.calls if "TRUNCATE" in c)
+    )
 
 
 def test_checkpoint_falls_back_to_passive_on_truncate_error() -> None:

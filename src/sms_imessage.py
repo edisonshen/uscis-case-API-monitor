@@ -62,6 +62,13 @@ def checkpoint_wal(cursor: sqlite3.Cursor) -> None:
     never blocks the writer and folds whatever WAL pages it can. PASSIVE is
     the best-effort floor: if it too is busy or raises, we swallow it — the
     row will be picked up on a later poll once auto-checkpoint catches up.
+
+    NON-BLOCKING: the connection is opened with ``timeout=5``, so a contended
+    TRUNCATE could otherwise block up to 5s waiting for the writer lock and
+    starve the ~2s poll loop. We set ``busy_timeout=0`` for the duration of the
+    checkpoints so a busy checkpoint returns ``busy=1`` IMMEDIATELY instead of
+    waiting, then restore the prior busy_timeout so the row SELECT keeps its
+    normal wait behaviour.
     """
 
     def _busy(result) -> bool:
@@ -72,6 +79,15 @@ def checkpoint_wal(cursor: sqlite3.Cursor) -> None:
         except (TypeError, IndexError):
             return False
 
+    # Read & zero the busy timeout so the checkpoints never wait on the writer.
+    prior_timeout_ms = None
+    try:
+        row = cursor.execute("PRAGMA busy_timeout;").fetchone()
+        prior_timeout_ms = row[0] if row else None
+        cursor.execute("PRAGMA busy_timeout=0;")
+    except sqlite3.OperationalError:
+        prior_timeout_ms = None
+
     try:
         truncate_busy = _busy(cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone())
     except sqlite3.OperationalError:
@@ -81,6 +97,14 @@ def checkpoint_wal(cursor: sqlite3.Cursor) -> None:
         try:
             cursor.execute("PRAGMA wal_checkpoint(PASSIVE);").fetchone()
         except sqlite3.OperationalError:
+            pass
+
+    # Restore the prior busy timeout so the subsequent row SELECT keeps its
+    # normal wait behaviour. Best-effort; never raise out of this helper.
+    if prior_timeout_ms is not None:
+        try:
+            cursor.execute(f"PRAGMA busy_timeout={int(prior_timeout_ms)};")
+        except (sqlite3.OperationalError, ValueError, TypeError):
             pass
 
 
