@@ -14,11 +14,15 @@ import pytest
 
 import sqlite3
 
+import sms_imessage
 from sms_imessage import (
+    MessageConfig,
     OTP_KEYWORDS,
     checkpoint_wal,
     extract_code_from_row,
     extract_printable_runs,
+    is_full_disk_access_error,
+    poll_for_code_from_messages,
 )
 from tests.conftest import FIXTURES
 
@@ -231,3 +235,100 @@ def test_checkpoint_busy_truncate_then_busy_passive_no_raise() -> None:
     checkpoint_wal(cur)
     assert any("TRUNCATE" in c for c in cur.calls)
     assert any("PASSIVE" in c for c in cur.calls)
+
+
+# --- Full Disk Access denial classification + non-retry signalling ---------
+
+
+def test_is_full_disk_access_error_recognizes_databaseerror() -> None:
+    # SQLITE_AUTH ("authorization denied") arrives as sqlite3.DatabaseError,
+    # NOT OperationalError — the exact miss that hid the FDA hint pre-2026-07-08.
+    assert is_full_disk_access_error(sqlite3.DatabaseError("authorization denied"))
+
+
+def test_is_full_disk_access_error_recognizes_operation_not_permitted() -> None:
+    assert is_full_disk_access_error(sqlite3.DatabaseError("operation not permitted"))
+
+
+def test_is_full_disk_access_error_recognizes_cantopen() -> None:
+    # SQLITE_CANTOPEN: TCC can block the file open instead of the query.
+    assert is_full_disk_access_error(sqlite3.OperationalError("unable to open database file"))
+
+
+def test_is_full_disk_access_error_false_for_lock() -> None:
+    # A genuine lock is transient (retryable) — must not be treated as FDA.
+    assert not is_full_disk_access_error(sqlite3.OperationalError("database is locked"))
+
+
+def test_is_full_disk_access_error_false_for_disk_io() -> None:
+    # SQLITE_IOERR is hardware/transient, not a permission denial.
+    assert not is_full_disk_access_error(sqlite3.OperationalError("disk I/O error"))
+
+
+def _denied_config() -> MessageConfig:
+    return MessageConfig(
+        code_regex=r"\b(\d{6})\b",
+        timeout_seconds=5,
+        poll_interval_seconds=2,
+        since_seconds=600,
+    )
+
+
+def test_poll_raises_permission_error_when_denied_every_poll(monkeypatch) -> None:
+    # Every poll denied and no query ever succeeds -> PermissionError (exit 3),
+    # so the Node scheduler pauses instead of fast-retrying (and re-texting).
+    monkeypatch.setattr(sms_imessage, "get_messages_db_path", lambda: "/fake/chat.db")
+
+    def _deny(*_args, **_kwargs):
+        raise sqlite3.DatabaseError("authorization denied")
+
+    monkeypatch.setattr(sms_imessage.sqlite3, "connect", _deny)
+
+    # Deterministic fake clock: time only advances when the loop "sleeps", so
+    # the deadline is crossed after a fixed number of polls — no real sleeping.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(sms_imessage.time, "time", lambda: clock["t"])
+
+    def _advance(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(sms_imessage.time, "sleep", _advance)
+
+    with pytest.raises(PermissionError):
+        poll_for_code_from_messages(_denied_config())
+
+
+class _DenyingCursor:
+    """Cursor whose every execute() raises SQLITE_AUTH — the realistic path
+    where connect() succeeds (it's lazy) and the denial fires at the first
+    checkpoint PRAGMA / the SELECT, not at connect."""
+
+    def execute(self, *_args, **_kwargs):
+        raise sqlite3.DatabaseError("authorization denied")
+
+    def close(self) -> None:
+        pass
+
+
+class _DenyingConn:
+    row_factory = None
+
+    def cursor(self) -> _DenyingCursor:
+        return _DenyingCursor()
+
+    def close(self) -> None:
+        pass
+
+
+def test_poll_permission_error_when_denial_fires_after_connect(monkeypatch) -> None:
+    # connect() succeeds; the denial surfaces inside checkpoint_wal/SELECT. A
+    # DatabaseError there propagates past checkpoint_wal's OperationalError-only
+    # guard, so saw_permission_denial is set and saw_successful_query never is.
+    monkeypatch.setattr(sms_imessage, "get_messages_db_path", lambda: "/fake/chat.db")
+    monkeypatch.setattr(sms_imessage.sqlite3, "connect", lambda *_a, **_k: _DenyingConn())
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(sms_imessage.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(sms_imessage.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+
+    with pytest.raises(PermissionError):
+        poll_for_code_from_messages(_denied_config())

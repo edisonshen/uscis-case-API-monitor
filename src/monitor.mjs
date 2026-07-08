@@ -222,7 +222,17 @@ function readOtp(otpConfig) {
 
       child.on("close", (code) => {
         if (code !== 0) {
-          reject(new Error("Failed to read OTP from SMS/iMessage"));
+          // Exit 3 = the Python reader hit a Full Disk Access denial on
+          // chat.db (see sms_imessage.py). Tag it so the scheduler pauses OTP
+          // retries instead of fast-retrying — a permission error can't be
+          // fixed by retrying and each retry triggers another USCIS text.
+          const err = new Error(
+            code === 3
+              ? "Full Disk Access denied reading Messages database"
+              : "Failed to read OTP from SMS/iMessage",
+          );
+          if (code === 3) err.code = "OTP_PERMISSION_DENIED";
+          reject(err);
           return;
         }
         resolve(stdout.trim());
@@ -530,6 +540,11 @@ async function login(config) {
   // the "Login did not stick" throw with code OTP_LOGIN_FAILED so the
   // scheduler can fast-retry instead of waiting 6h.
   let otpFailed = false;
+  // Set true when the OTP read failed specifically because macOS denied Full
+  // Disk Access to chat.db. Retrying can't fix that (and each retry triggers
+  // another USCIS text), so we tag the throw OTP_PERMISSION_DENIED instead —
+  // the scheduler pauses retries and notifies once rather than fast-retrying.
+  let otpPermissionDenied = false;
   try {
     console.log("Starting login process...");
     console.log(`Navigating to ${config.loginUrl}`);
@@ -594,6 +609,7 @@ async function login(config) {
       // stick" throw below carries OTP_LOGIN_FAILED and the scheduler
       // fast-retries with a fresh code instead of waiting 6h.
       otpFailed = true;
+      if (otpError?.code === "OTP_PERMISSION_DENIED") otpPermissionDenied = true;
       console.error(`⚠️  OTP handling error (continuing): ${otpError.message}`);
       await writeDebugSnapshot(page, "otp-error");
     }
@@ -623,8 +639,10 @@ async function login(config) {
       );
       // If the login failed specifically because the OTP step failed, tag it
       // so the scheduler fast-retries (15 min) instead of falling back to 6h.
+      // A Full Disk Access denial gets a distinct tag so the scheduler pauses
+      // (and notifies once) rather than fast-retrying an unfixable failure.
       if (otpFailed) {
-        err.code = "OTP_LOGIN_FAILED";
+        err.code = otpPermissionDenied ? "OTP_PERMISSION_DENIED" : "OTP_LOGIN_FAILED";
       }
       throw err;
     }
@@ -1139,6 +1157,14 @@ function decideNextDelay({
   fallbackDelayMs,
 }) {
   const { maxRetries, retryIntervalMinutes } = { ...DEFAULT_OTP_RETRY, ...(cfg || {}) };
+
+  // A Full Disk Access denial can't be fixed by retrying, and every retry makes
+  // USCIS text another code. Never fast-retry it: fall back to the normal
+  // schedule and let the caller notify the operator once.
+  if (error?.code === "OTP_PERMISSION_DENIED") {
+    return { delayMs: fallbackDelayMs, isRetry: false, exhausted: false, permissionDenied: true };
+  }
+
   const isOtpFailure = error?.code === "OTP_LOGIN_FAILED";
 
   if (isOtpFailure && withinSchedule) {
@@ -1153,6 +1179,25 @@ function decideNextDelay({
     return { delayMs: retryIntervalMinutes * 60 * 1000, isRetry: true, exhausted: false };
   }
   return { delayMs: fallbackDelayMs, isRetry: false, exhausted: false };
+}
+
+// Pure: decide whether to send the Full Disk Access denial notice, and the next
+// value of the "already notified" flag. Notify once per denial STREAK.
+//
+// A streak ends only when a check actually RAN with a non-denial outcome. An
+// out-of-window run skips the check entirely (no login, no OTP read), so it is
+// NOT evidence that access was restored — it must leave the flag untouched, or
+// a persistent denial re-pings every time a 6h run lands after hours.
+//
+//   denied, not yet notified   -> notify now, mark notified
+//   denied, already notified   -> stay silent, stay notified
+//   non-denial, check ran      -> reset (next denial re-notifies)
+//   non-denial, check skipped  -> unchanged (streak not broken by a no-op)
+function nextPermissionNotifyState(decision, checkRan, alreadyNotified) {
+  if (decision.permissionDenied) {
+    return { notify: !alreadyNotified, notified: true };
+  }
+  return { notify: false, notified: checkRan ? false : alreadyNotified };
 }
 
 function isWithinSchedule(when = new Date()) {
@@ -1227,11 +1272,38 @@ async function runScheduler(config) {
   console.log("🕐 USCIS Case Monitor Scheduler started");
   console.log("   Schedule: Weekdays 9am–8pm ET, every 6 hours");
   console.log("   Press Ctrl+C to stop\n");
-  
+
+  // Record our own PID so `./uscis.sh status|stop|logs` stay accurate whether
+  // we were launched by uscis.sh (nohup) or directly by launchd. Remove the
+  // file on clean exit so a stale PID never lingers. On SIGTERM/SIGINT (e.g.
+  // `uscis.sh stop`) exit 0 — under launchd's KeepAlive{SuccessfulExit:false}
+  // a deliberate stop stays stopped, while a crash (non-zero) auto-restarts.
+  const pidFile = path.join(stateDir, "scheduler.pid");
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(pidFile, String(process.pid));
+  } catch (e) {
+    console.error(`⚠️  Could not write PID file: ${e.message}`);
+  }
+  const cleanupPid = () => {
+    try {
+      if (fs.readFileSync(pidFile, "utf8").trim() === String(process.pid)) {
+        fs.unlinkSync(pidFile);
+      }
+    } catch {}
+  };
+  process.on("exit", cleanupPid);
+  process.on("SIGTERM", () => { cleanupPid(); process.exit(0); });
+  process.on("SIGINT", () => { cleanupPid(); process.exit(0); });
+
   const otpCfg = { ...DEFAULT_OTP_RETRY, ...(config.otpRetry || {}) };
   // Counts consecutive OTP-not-stick failures in the current fast-retry
   // burst. Reset to 0 on any success or on exhaustion.
   let otpRetryCount = 0;
+  // True once we've sent the operator a Full Disk Access denial notice for the
+  // current broken streak. Reset on any non-denial outcome so a persistent
+  // denial pings once, not every 6h scheduled run.
+  let notifiedPermissionDenied = false;
 
   const run = async () => {
     let runError = null;
@@ -1270,7 +1342,25 @@ async function runScheduler(config) {
       fallbackDelayMs: nextScheduledRun(),
     });
 
-    if (decision.exhausted) {
+    // Notify-once bookkeeping for the FDA-denial streak. `withinSchedule` is
+    // the "a check actually ran this cycle" signal — an out-of-window skip must
+    // not reset the flag (see nextPermissionNotifyState).
+    const notifyState = nextPermissionNotifyState(
+      decision,
+      withinSchedule,
+      notifiedPermissionDenied,
+    );
+    notifiedPermissionDenied = notifyState.notified;
+
+    if (decision.permissionDenied) {
+      // Full Disk Access is denied — retrying only spams USCIS texts. Skip the
+      // burst; notify the operator once per streak.
+      console.error("🔒 Full Disk Access denied — can't read the OTP text. Pausing OTP retries.");
+      if (notifyState.notify) {
+        await notifyPermissionDenied(config);
+      }
+      otpRetryCount = 0;
+    } else if (decision.exhausted) {
       console.error(`❌ OTP fast-retry exhausted after ${otpRetryCount} attempts`);
       await notifyOtpExhausted(config, otpRetryCount);
       otpRetryCount = 0;
@@ -1308,6 +1398,18 @@ async function notifyOtpExhausted(config, attempts) {
   await sendDiscordWebhook(webhookUrl, {
     content: `❌ \`${ts} UTC\` couldn't read OTP after ${n} ${n === 1 ? "try" : "tries"} — falling back to the 6h schedule.`,
   }).catch((err) => console.error(`  ✗ OTP-exhaustion notification failed: ${err.message}`));
+}
+
+// Send a single Discord notice when the OTP read fails because macOS denied
+// Full Disk Access to chat.db. This is an operator-actionable config problem,
+// not a transient miss — so we surface the fix instead of silently retrying.
+async function notifyPermissionDenied(config) {
+  const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
+  if (!webhookUrl) return;
+  const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+  await sendDiscordWebhook(webhookUrl, {
+    content: `🔒 \`${ts} UTC\` Can't read the OTP text — macOS Full Disk Access is denied for the monitor. Grant it to the node binary (System Settings → Privacy & Security → Full Disk Access) and restart the scheduler. Pausing OTP retries until then.`,
+  }).catch((err) => console.error(`  ✗ Permission-denied notification failed: ${err.message}`));
 }
 
 async function smsTest() {
@@ -1440,7 +1542,7 @@ async function main() {
 }
 
 // Exported for unit tests (tests/monitor.test.mjs). All pure.
-export { decideNextDelay, DEFAULT_OTP_RETRY, isVerificationPageUrl };
+export { decideNextDelay, nextPermissionNotifyState, DEFAULT_OTP_RETRY, isVerificationPageUrl };
 
 // Only run the CLI when invoked directly (`node src/monitor.mjs ...`), not
 // when imported by the test runner. import.meta.url vs argv[1] is the

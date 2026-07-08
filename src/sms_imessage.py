@@ -174,6 +174,40 @@ def extract_code_from_row(
     return matched.group(1) if matched.groups() else matched.group(0)
 
 
+class FullDiskAccessDenied(PermissionError):
+    """chat.db is unreadable because macOS denied Full Disk Access.
+
+    A dedicated type (not the builtin PermissionError) so ``main`` maps ONLY a
+    classified TCC denial to exit 3 — a stray PermissionError from unrelated
+    code falls through to the generic exit 1 and keeps normal retry semantics.
+    """
+
+
+_FDA_DENIAL_MARKERS = (
+    # SQLITE_AUTH — the form observed on this operator's Mac (2026-07-08).
+    "authorization denied",
+    "operation not permitted",
+    # SQLITE_CANTOPEN — TCC can block the file *open* instead of the query,
+    # since sqlite3.connect() is lazy and the denial first fires at the
+    # checkpoint/SELECT. Safe to treat as a denial: the caller only acts on it
+    # when NOT one single poll ever read the DB (saw_successful_query), so a
+    # genuinely transient open failure (which recovers mid-window) won't match.
+    "unable to open database file",
+)
+
+
+def is_full_disk_access_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a macOS Full Disk Access (TCC) denial on chat.db.
+
+    ``SQLITE_AUTH`` ("authorization denied") surfaces as ``sqlite3.DatabaseError``
+    — NOT ``sqlite3.OperationalError`` — so callers must ``except sqlite3.Error``
+    (the base class of both) and classify with this, or the denial is mistaken
+    for a transient error and the actionable hint never prints (2026-07-08 bug).
+    """
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _FDA_DENIAL_MARKERS)
+
+
 def poll_for_code_from_messages(config: MessageConfig) -> str:
     """Poll iMessage database for OTP code from SMS containing verification keywords."""
     db_path = get_messages_db_path()
@@ -193,6 +227,12 @@ def poll_for_code_from_messages(config: MessageConfig) -> str:
     cutoff_ns = int(now_macos - (config.since_seconds * 1_000_000_000))
     
     attempt = 0
+    # Distinguish a standing Full Disk Access denial (unfixable by retrying)
+    # from a code that simply hasn't arrived yet. If EVERY poll is denied and
+    # not one query ever succeeds, the caller must NOT fast-retry — each retry
+    # makes USCIS text another code — so we surface PermissionError below.
+    saw_permission_denial = False
+    saw_successful_query = False
 
     while time.time() < deadline:
         attempt += 1
@@ -245,6 +285,9 @@ def poll_for_code_from_messages(config: MessageConfig) -> str:
 
             candidates = []
             rows = cursor.fetchall()
+            # A completed SELECT proves the DB is readable this poll, so any
+            # earlier denial was transient — not a standing FDA problem.
+            saw_successful_query = True
 
             if rows:
                 print(
@@ -294,17 +337,20 @@ def poll_for_code_from_messages(config: MessageConfig) -> str:
 
             conn.close()
 
-        except sqlite3.OperationalError as e:
-            # Database might be locked if Messages app is using it
-            error_msg = str(e).lower()
-            if "authorization denied" in error_msg or "operation not permitted" in error_msg:
+        except sqlite3.Error as e:
+            # Catch the sqlite3.Error BASE, not OperationalError: a Full Disk
+            # Access denial ("authorization denied") is SQLITE_AUTH, which maps
+            # to sqlite3.DatabaseError — a sibling of OperationalError. Catching
+            # only OperationalError let the denial fall through to the generic
+            # handler below, so the actionable hint never printed (2026-07-08).
+            if is_full_disk_access_error(e):
+                saw_permission_denial = True
                 print(
-                    f"[sms-test] ❌ Full Disk Access permission required!\n"
-                    f"[sms-test] Fix: System Settings > Privacy & Security > Full Disk Access\n"
-                    f"[sms-test]      1. Click + and add Terminal.app or VS Code\n"
-                    f"[sms-test]      2. Restart terminal/editor\n"
-                    f"[sms-test]      3. Close Messages app\n"
-                    f"[sms-test]      4. Try again",
+                    f"[sms-test] ❌ Full Disk Access denied reading chat.db.\n"
+                    f"[sms-test] The scheduler runs under launchd, so grant Full Disk\n"
+                    f"[sms-test] Access to the NODE binary in the plist (not your\n"
+                    f"[sms-test] terminal): System Settings > Privacy & Security >\n"
+                    f"[sms-test] Full Disk Access > + > add node, then restart the agent.",
                     file=sys.stderr, flush=True
                 )
             else:
@@ -314,6 +360,13 @@ def poll_for_code_from_messages(config: MessageConfig) -> str:
 
         time.sleep(config.poll_interval_seconds)
 
+    if saw_permission_denial and not saw_successful_query:
+        # Retrying can't fix a permissions problem — signal the caller to pause
+        # (exit 3) instead of triggering yet another OTP text on a fast-retry.
+        raise FullDiskAccessDenied(
+            "Full Disk Access denied for ~/Library/Messages/chat.db — grant it "
+            "to the node binary running the scheduler, then restart the agent."
+        )
     raise TimeoutError("Timed out waiting for verification code in Messages")
 
 
@@ -322,6 +375,11 @@ def main() -> int:
     try:
         poll_for_code_from_messages(config)
         return 0
+    except FullDiskAccessDenied as exc:
+        # Distinct exit code so the Node scheduler pauses OTP retries (and
+        # notifies once) instead of fast-retrying an unfixable permission error.
+        print(f"[sms-test] {exc}", file=sys.stderr, flush=True)
+        return 3
     except Exception as exc:
         import traceback
         traceback.print_exc(file=sys.stderr)

@@ -10,9 +10,13 @@ import assert from "node:assert/strict";
 
 import {
   decideNextDelay,
+  nextPermissionNotifyState,
   DEFAULT_OTP_RETRY,
   isVerificationPageUrl,
 } from "../src/monitor.mjs";
+
+const DENIED = { permissionDenied: true };
+const NOT_DENIED = { permissionDenied: false };
 
 const CFG = { maxRetries: 8, retryIntervalMinutes: 15 };
 const FALLBACK = 6 * 60 * 60 * 1000; // stand-in for nextScheduledRun()
@@ -60,6 +64,45 @@ test("cap reached -> fall back to scheduled run and mark exhausted", () => {
   assert.equal(out.delayMs, FALLBACK);
   assert.equal(out.isRetry, false);
   assert.equal(out.exhausted, true);
+});
+
+function permissionDeniedError() {
+  const e = new Error("Full Disk Access denied reading Messages database");
+  e.code = "OTP_PERMISSION_DENIED";
+  return e;
+}
+
+test("permission-denied OTP error -> no retry, permissionDenied flag, scheduled run", () => {
+  const out = decideNextDelay({
+    error: permissionDeniedError(),
+    retryCount: 0,
+    withinSchedule: true,
+    retryWithinSchedule: true,
+    cfg: CFG,
+    fallbackDelayMs: FALLBACK,
+  });
+  assert.deepEqual(out, {
+    delayMs: FALLBACK,
+    isRetry: false,
+    exhausted: false,
+    permissionDenied: true,
+  });
+});
+
+test("permission-denied never fast-retries even with retry budget in-window", () => {
+  // Identical inputs that WOULD fast-retry an OTP_LOGIN_FAILED must not retry
+  // here — a permission error is unfixable by retrying and spams USCIS texts.
+  const out = decideNextDelay({
+    error: permissionDeniedError(),
+    retryCount: 3,
+    withinSchedule: true,
+    retryWithinSchedule: true,
+    cfg: CFG,
+    fallbackDelayMs: FALLBACK,
+  });
+  assert.equal(out.isRetry, false);
+  assert.equal(out.permissionDenied, true);
+  assert.equal(out.delayMs, FALLBACK);
 });
 
 test("success (no error) -> scheduled run, no retry, not exhausted", () => {
@@ -227,4 +270,42 @@ test("stuck-on-verification guard fires only when otpFailed AND on a verificatio
   assert.equal(guard(true, "https://my.uscis.gov/account/verification"), true);
   assert.equal(guard(false, "https://my.uscis.gov/account/verification"), false); // OTP not attempted
   assert.equal(guard(true, "https://my.uscis.gov/dashboard"), false); // navigated away = success
+});
+
+// --- FDA-denial notify-once lifecycle (nextPermissionNotifyState) ----------
+
+test("first denial notifies and marks notified", () => {
+  assert.deepEqual(nextPermissionNotifyState(DENIED, true, false), { notify: true, notified: true });
+});
+
+test("repeated denial in the same streak stays silent", () => {
+  assert.deepEqual(nextPermissionNotifyState(DENIED, true, true), { notify: false, notified: true });
+});
+
+test("a check that ran without denial resets the streak (next denial re-notifies)", () => {
+  assert.deepEqual(nextPermissionNotifyState(NOT_DENIED, true, true), { notify: false, notified: false });
+});
+
+// Regression: an out-of-window run skips the check entirely, so it must NOT
+// reset the notify flag — else a persistent denial re-pings whenever a 6h run
+// lands after 8pm/overnight (adversarial review P2).
+test("an out-of-window skip does NOT reset the notify flag", () => {
+  assert.deepEqual(nextPermissionNotifyState(NOT_DENIED, false, true), { notify: false, notified: true });
+});
+
+test("denial while notified is only re-notified after a real check clears the streak", () => {
+  let notified = false;
+  // Day 1: denied in-window -> notify.
+  let s = nextPermissionNotifyState(DENIED, true, notified); notified = s.notified;
+  assert.equal(s.notify, true);
+  // Later same day: denied again in-window -> silent.
+  s = nextPermissionNotifyState(DENIED, true, notified); notified = s.notified;
+  assert.equal(s.notify, false);
+  // Overnight: out-of-window skip -> still silent, flag preserved.
+  s = nextPermissionNotifyState(NOT_DENIED, false, notified); notified = s.notified;
+  assert.equal(s.notify, false);
+  assert.equal(notified, true);
+  // Next morning: still denied in-window -> STILL silent (never fixed).
+  s = nextPermissionNotifyState(DENIED, true, notified); notified = s.notified;
+  assert.equal(s.notify, false);
 });
