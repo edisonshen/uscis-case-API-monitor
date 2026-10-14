@@ -1133,7 +1133,7 @@ const DEFAULT_OTP_RETRY = { maxRetries: 8, retryIntervalMinutes: 15 };
 // long to wait before the next run and whether this is a fast OTP retry.
 //
 // PURE — no timers, no Date, no I/O. The caller passes `fallbackDelayMs` (the
-// result of `nextScheduledRun()`) so this function — and its tests — stay
+// result of `planRun().nextDelayMs`) so this function — and its tests — stay
 // deterministic.
 //
 //   OTP failure, in-window, budget left, retry lands in-window -> retry in N min
@@ -1147,7 +1147,7 @@ const DEFAULT_OTP_RETRY = { maxRetries: 8, retryIntervalMinutes: 15 };
 // still inside the 9am–8pm ET window. A late-day OTP failure whose retry would
 // wake after hours must NOT schedule a dead retry (it would skip the check and
 // reset the burst silently — the 2026-06-05 silence bug). Instead we exhaust:
-// fall back to nextScheduledRun() AND fire the operator notice.
+// fall back to the next slot AND fire the operator notice.
 function decideNextDelay({
   error,
   retryCount,
@@ -1200,41 +1200,153 @@ function nextPermissionNotifyState(decision, checkRan, alreadyNotified) {
   return { notify: false, notified: checkRan ? false : alreadyNotified };
 }
 
-function isWithinSchedule(when = new Date()) {
-  // Check if `when` (default: now) is within ET weekday 9am-8pm
-  const now = when;
-  const etStr = now.toLocaleString("en-US", { timeZone: "America/New_York" });
-  const et = new Date(etStr);
-  const day = et.getDay(); // 0=Sun, 6=Sat
-  const hour = et.getHours();
-  if (day === 0 || day === 6) return false;
-  return hour >= 9 && hour < 20;
+// ---- Schedule (ET weekdays, fixed slots) ------------------------------------
+//
+// Every decision below is a PURE function of one `now` Date so a single
+// scheduler tick can never see two different clock readings. The 2026-10-14
+// skip happened because `isWithinSchedule()` and `nextScheduledRun()` each
+// read the clock: the timer woke a few ms before 9:00:00 ET (the old delay
+// dropped the millisecond part), the first call said "outside", the second
+// (now past 9:00) said "inside -> +6h", and the 9 AM check was lost.
+
+const SCHEDULE_TZ = "America/New_York";
+const SLOT_HOURS_ET = [9, 15];     // checks run at 9:00 and 15:00 ET on weekdays
+const WINDOW_START_HOUR = 9;
+const WINDOW_END_HOUR = 20;        // exclusive
+// A timer that wakes this close before a slot counts as that slot (and must
+// not be re-armed for the same slot). Covers timer jitter; see planRun().
+const SLOT_TOLERANCE_MS = 5_000;
+// After a (re)start, how long to wait before a catch-up check when the most
+// recent slot was missed — lets a rebooting machine settle instead of
+// launching Chrome under boot load (the 2026-10-14 "browser closed" failure).
+const STARTUP_SETTLE_MS = 5 * 60 * 1000;
+const MIN_DELAY_MS = 60_000;
+
+// ET wall-clock of `now`, expressed as a Date in the process's local frame
+// (so getDay/getHours read ET components). Keeps the millisecond part, which
+// `toLocaleString` drops — otherwise delays computed from it are up to 999 ms
+// short and the timer wakes before the slot.
+function toEastern(now) {
+  const et = new Date(now.toLocaleString("en-US", { timeZone: SCHEDULE_TZ }));
+  et.setMilliseconds(now.getMilliseconds());
+  return et;
 }
 
-function nextScheduledRun() {
-  // Returns ms until next valid run window (ET weekday 9am)
-  const now = new Date();
-  const etStr = now.toLocaleString("en-US", { timeZone: "America/New_York" });
-  const et = new Date(etStr);
+function isWeekday(et) {
   const day = et.getDay();
+  return day >= 1 && day <= 5;
+}
+
+function inWindow(et) {
   const hour = et.getHours();
-  
-  // If within schedule, next run in 3h
-  if (day >= 1 && day <= 5 && hour >= 9 && hour < 20) {
-    return 6 * 60 * 60 * 1000;
+  return isWeekday(et) && hour >= WINDOW_START_HOUR && hour < WINDOW_END_HOUR;
+}
+
+function isWithinSchedule(when = new Date()) {
+  return inWindow(toEastern(when));
+}
+
+// First slot strictly after `et` (ET frame). Weekends and after-hours roll to
+// the next weekday's first slot.
+function nextSlotAfter(et) {
+  for (let dayOffset = 0; dayOffset <= 7; dayOffset++) {
+    const candidate = new Date(et);
+    candidate.setDate(et.getDate() + dayOffset);
+    if (!isWeekday(candidate)) continue;
+    for (const hour of SLOT_HOURS_ET) {
+      candidate.setHours(hour, 0, 0, 0);
+      if (candidate.getTime() > et.getTime()) return new Date(candidate);
+    }
   }
-  
-  // Calculate time until next weekday 9am ET
-  let daysUntil;
-  if (day === 6) daysUntil = 2; // Sat -> Mon
-  else if (day === 0) daysUntil = 1; // Sun -> Mon
-  else if (hour >= 20) daysUntil = (day === 5) ? 3 : 1; // After 8pm, next weekday
-  else daysUntil = 0; // Before 9am today
-  
-  const next = new Date(et);
-  next.setDate(next.getDate() + daysUntil);
-  next.setHours(9, 0, 0, 0);
-  return Math.max(next.getTime() - et.getTime(), 60000);
+  throw new Error("nextSlotAfter: no slot within 7 days (unreachable)");
+}
+
+// Most recent slot at or before `et`, or null if none this week yet matters
+// (we only look back 7 days).
+function lastSlotAtOrBefore(et) {
+  for (let dayOffset = 0; dayOffset <= 7; dayOffset++) {
+    const candidate = new Date(et);
+    candidate.setDate(et.getDate() - dayOffset);
+    if (!isWeekday(candidate)) continue;
+    for (const hour of [...SLOT_HOURS_ET].reverse()) {
+      candidate.setHours(hour, 0, 0, 0);
+      if (candidate.getTime() <= et.getTime()) return new Date(candidate);
+    }
+  }
+  return null;
+}
+
+// Real instant of an ET-frame wall-clock time. The ET<->real offset can differ
+// between `now` and the target (a DST switch in between), so refine once.
+function etToInstant(etFrame, now) {
+  const offsetAt = (instant) => instant.getTime() - toEastern(instant).getTime();
+  const guess = new Date(etFrame.getTime() + offsetAt(now));
+  return new Date(etFrame.getTime() + offsetAt(guess));
+}
+
+// One scheduler tick's view of the clock. `withinSchedule`: should a check
+// run now? `nextDelayMs`: ms until the next slot, measured from this same
+// `now`. A wake-up within SLOT_TOLERANCE_MS before a slot is treated as that
+// slot: it runs now and the next delay targets the slot after it.
+function planRun(now = new Date(), { toleranceMs = SLOT_TOLERANCE_MS } = {}) {
+  const et = toEastern(now);
+  const effective = new Date(et.getTime() + toleranceMs);
+  const withinSchedule = inWindow(et) || inWindow(effective);
+  const nextSlot = nextSlotAfter(effective);
+  const nextDelayMs = Math.max(etToInstant(nextSlot, now).getTime() - now.getTime(), MIN_DELAY_MS);
+  return { withinSchedule, nextDelayMs, nextSlotEt: nextSlot };
+}
+
+// Latest completed fetch recorded in case-history.json, or null.
+function lastCheckedAtFromHistory(history) {
+  let latest = null;
+  for (const entry of Object.values(history || {})) {
+    const t = entry?.lastFetchAt ? Date.parse(entry.lastFetchAt) : NaN;
+    if (!Number.isNaN(t) && (latest === null || t > latest)) latest = t;
+  }
+  return latest === null ? null : new Date(latest);
+}
+
+// What to do when the scheduler (re)starts. Never run immediately: a launchd
+// restart after reboot lands at a random time under boot load. If the most
+// recent slot has no completed check after it (missed, e.g. the machine was
+// down at 9:00) and we are still inside the window, catch up after a settle
+// delay; otherwise sleep until the next slot.
+function planStartup({ now = new Date(), lastCheckedAt = null, settleMs = STARTUP_SETTLE_MS } = {}) {
+  const plan = planRun(now);
+  const et = toEastern(now);
+  const lastSlot = lastSlotAtOrBefore(et);
+  const lastSlotMissed =
+    lastSlot !== null &&
+    inWindow(et) &&
+    (lastCheckedAt === null || toEastern(lastCheckedAt).getTime() < lastSlot.getTime());
+  if (lastSlotMissed) {
+    const delayMs = Math.min(settleMs, plan.nextDelayMs);
+    return { delayMs, reason: "missed-slot-catch-up", nextSlotEt: plan.nextSlotEt };
+  }
+  return { delayMs: plan.nextDelayMs, reason: "next-slot", nextSlotEt: plan.nextSlotEt };
+}
+
+// OTP failures have their own operator notices (fast-retry exhaustion, Full
+// Disk Access denial) — posting on each of those too would spam a burst of
+// retries. Everything else (expired session that re-auth couldn't fix, a
+// crashed browser, network errors, ...) was previously silent and must ping.
+function shouldNotifyCheckFailure(error) {
+  const code = error?.code;
+  return code !== "OTP_LOGIN_FAILED" && code !== "OTP_PERMISSION_DENIED";
+}
+
+async function notifyCheckFailed(config, error) {
+  const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
+  if (!webhookUrl) return;
+  const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+  await sendDiscordWebhook(webhookUrl, {
+    content: `❌ \`${ts} UTC\` Scheduled check failed: ${error.message}`,
+  }).catch((err) => console.error(`  ✗ Check-failure notification failed: ${err.message}`));
+}
+
+function formatEt(et) {
+  return et.toLocaleString("en-US");
 }
 
 async function scheduledCheck(config) {
@@ -1248,29 +1360,12 @@ async function scheduledCheck(config) {
     await login(config);
   }
   
-  try {
-    // Try fetching with existing token
-    await checkAllCases(config);
-  } catch (error) {
-    if (error.code === "SESSION_EXPIRED" || error.message?.includes("SESSION_EXPIRED")) {
-      // checkAllCases already retries once with auto-reauth
-      // If we're here, the retry also failed
-      console.error("❌ Failed even after re-authentication");
-      const webhookUrl = config?.discordWebhookUrl || process.env.PHONEMONITOR_DISCORD_WEBHOOK_URL;
-      if (webhookUrl) {
-        await sendDiscordWebhook(webhookUrl, {
-          content: `❌ \`${new Date().toISOString().replace("T", " ").slice(0, 19)} UTC\` Scheduled check failed: ${error.message}`,
-        }).catch((err) => console.error(`  ✗ Scheduled-check failure notification failed: ${err.message}`));
-      }
-    } else {
-      throw error;
-    }
-  }
+  await checkAllCases(config);
 }
 
 async function runScheduler(config) {
   console.log("🕐 USCIS Case Monitor Scheduler started");
-  console.log("   Schedule: Weekdays 9am–8pm ET, every 6 hours");
+  console.log("   Schedule: Weekdays 9:00 and 15:00 ET (window 9am–8pm ET)");
   console.log("   Press Ctrl+C to stop\n");
 
   // Record our own PID so `./uscis.sh status|stop|logs` stay accurate whether
@@ -1307,13 +1402,18 @@ async function runScheduler(config) {
 
   const run = async () => {
     let runError = null;
-    const withinSchedule = isWithinSchedule();
+    // Read the clock ONCE per tick; every decision below derives from it.
+    const plan = planRun();
+    const { withinSchedule } = plan;
     if (withinSchedule) {
       try {
         await scheduledCheck(config);
       } catch (error) {
         runError = error;
         console.error(`❌ Scheduled check error: ${error.message}`);
+        if (shouldNotifyCheckFailure(error)) {
+          await notifyCheckFailed(config, error);
+        }
       }
     } else {
       const etStr = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
@@ -1339,7 +1439,7 @@ async function runScheduler(config) {
       withinSchedule,
       retryWithinSchedule,
       cfg: otpCfg,
-      fallbackDelayMs: nextScheduledRun(),
+      fallbackDelayMs: plan.nextDelayMs,
     });
 
     // Notify-once bookkeeping for the FDA-denial streak. `withinSchedule` is
@@ -1376,12 +1476,21 @@ async function runScheduler(config) {
     if (decision.isRetry) {
       console.log(`🔁 OTP fast-retry ${otpRetryCount}/${otpCfg.maxRetries} — next attempt in ${waitMin} minutes\n`);
     } else {
-      console.log(`⏳ Next check in ${waitMin} minutes\n`);
+      console.log(`⏳ Next check in ${waitMin} minutes (${formatEt(plan.nextSlotEt)} ET)\n`);
     }
     setTimeout(run, decision.delayMs);
   };
 
-  // Run immediately on start
+  // Never run immediately on start — align to the slot grid (catching up a
+  // missed slot after a settle delay). See planStartup().
+  const startup = planStartup({ lastCheckedAt: lastCheckedAtFromHistory(loadCaseHistory()) });
+  const startMin = Math.round(startup.delayMs / 60000);
+  if (startup.reason === "missed-slot-catch-up") {
+    console.log(`🕘 Last slot has no completed check — catch-up in ${startMin} minutes\n`);
+  } else {
+    console.log(`⏳ First check in ${startMin} minutes (${formatEt(startup.nextSlotEt)} ET)\n`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, startup.delayMs));
   await run();
 }
 
@@ -1542,7 +1651,19 @@ async function main() {
 }
 
 // Exported for unit tests (tests/monitor.test.mjs). All pure.
-export { decideNextDelay, nextPermissionNotifyState, DEFAULT_OTP_RETRY, isVerificationPageUrl };
+export {
+  decideNextDelay,
+  nextPermissionNotifyState,
+  DEFAULT_OTP_RETRY,
+  isVerificationPageUrl,
+  isWithinSchedule,
+  planRun,
+  planStartup,
+  lastCheckedAtFromHistory,
+  shouldNotifyCheckFailure,
+  SLOT_TOLERANCE_MS,
+  STARTUP_SETTLE_MS,
+};
 
 // Only run the CLI when invoked directly (`node src/monitor.mjs ...`), not
 // when imported by the test runner. import.meta.url vs argv[1] is the
