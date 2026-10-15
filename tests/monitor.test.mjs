@@ -13,6 +13,13 @@ import {
   nextPermissionNotifyState,
   DEFAULT_OTP_RETRY,
   isVerificationPageUrl,
+  isWithinSchedule,
+  planRun,
+  planStartup,
+  lastCheckedAtFromHistory,
+  shouldNotifyCheckFailure,
+  SLOT_TOLERANCE_MS,
+  STARTUP_SETTLE_MS,
 } from "../src/monitor.mjs";
 
 const DENIED = { permissionDenied: true };
@@ -308,4 +315,137 @@ test("denial while notified is only re-notified after a real check clears the st
   // Next morning: still denied in-window -> STILL silent (never fixed).
   s = nextPermissionNotifyState(DENIED, true, notified); notified = s.notified;
   assert.equal(s.notify, false);
+});
+
+// ---------------------------------------------------------------------------
+// Schedule planning (planRun / planStartup). All inputs are explicit instants;
+// October 2026 is EDT, so "ET wall clock" = the ISO string with -04:00.
+// 2026-10-14 is a Wednesday, 10-16 Friday, 10-17 Saturday, 10-19 Monday.
+// ---------------------------------------------------------------------------
+
+const et = (iso) => new Date(`${iso}-04:00`);
+const HOUR = 60 * 60 * 1000;
+const MIN = 60 * 1000;
+
+test("the 2026-10-14 skip: waking <1s before 9:00 ET runs now and targets 15:00, never +1min/skip", () => {
+  for (let ms = 0; ms < 1000; ms += 37) {
+    const now = et(`2026-10-14T08:59:59.${String(ms).padStart(3, "0")}`);
+    const plan = planRun(now);
+    assert.equal(plan.withinSchedule, true, `withinSchedule at .${ms}`);
+    assert.ok(plan.nextDelayMs > 5 * HOUR && plan.nextDelayMs <= 6 * HOUR + 1000, `next delay at .${ms}: ${plan.nextDelayMs}`);
+  }
+});
+
+test("exactly 9:00:00.000 ET: run now, next slot is 15:00 (6h)", () => {
+  const plan = planRun(et("2026-10-14T09:00:00.000"));
+  assert.equal(plan.withinSchedule, true);
+  assert.equal(plan.nextDelayMs, 6 * HOUR);
+});
+
+test("before the tolerance window: outside, and the delay keeps millisecond precision", () => {
+  const plan = planRun(et("2026-10-14T08:58:00.750"));
+  assert.equal(plan.withinSchedule, false);
+  assert.equal(plan.nextDelayMs, 2 * MIN - 750);
+});
+
+test("just inside the tolerance before 9:00 counts as the 9:00 slot", () => {
+  const now = et("2026-10-14T09:00:00.000");
+  const plan = planRun(new Date(now.getTime() - SLOT_TOLERANCE_MS + 1));
+  assert.equal(plan.withinSchedule, true);
+  assert.ok(plan.nextDelayMs > 5 * HOUR);
+});
+
+test("isWithinSchedule (retry-target check) has no tolerance", () => {
+  assert.equal(isWithinSchedule(et("2026-10-14T08:59:59.999")), false);
+  assert.equal(isWithinSchedule(et("2026-10-14T09:00:00.000")), true);
+  assert.equal(isWithinSchedule(et("2026-10-14T19:59:59.000")), true);
+  assert.equal(isWithinSchedule(et("2026-10-14T20:00:00.000")), false);
+  assert.equal(isWithinSchedule(et("2026-10-17T12:00:00.000")), false); // Saturday
+});
+
+test("after the 15:00 slot the next run is tomorrow 9:00", () => {
+  const plan = planRun(et("2026-10-14T15:00:30.000"));
+  assert.equal(plan.withinSchedule, true);
+  assert.equal(plan.nextDelayMs, 18 * HOUR - 30 * 1000);
+});
+
+test("Friday 15:00 -> Monday 9:00; Saturday -> Monday 9:00; weeknight 21:00 -> 9:00 next day", () => {
+  assert.equal(planRun(et("2026-10-16T15:00:30.000")).nextDelayMs, 66 * HOUR - 30 * 1000);
+  const sat = planRun(et("2026-10-17T10:00:00.000"));
+  assert.equal(sat.withinSchedule, false);
+  assert.equal(sat.nextDelayMs, 47 * HOUR);
+  const night = planRun(et("2026-10-14T21:00:00.000"));
+  assert.equal(night.withinSchedule, false);
+  assert.equal(night.nextDelayMs, 12 * HOUR);
+});
+
+test("end of window: 19:59:59 runs, 20:00:00 does not", () => {
+  assert.equal(planRun(et("2026-10-14T19:59:59.000")).withinSchedule, true);
+  assert.equal(planRun(et("2026-10-14T20:00:00.000")).withinSchedule, false);
+});
+
+test("slot search rolls over a month boundary and a DST switch (Sat Oct 31 -> Mon Nov 2 9:00 EST)", () => {
+  // Nov 1 2026 is the EDT->EST switch: 47h of ET wall clock is 48h of real time.
+  const plan = planRun(et("2026-10-31T10:00:00.000"));
+  assert.equal(plan.withinSchedule, false);
+  assert.equal(plan.nextDelayMs, 48 * HOUR);
+  assert.equal(plan.nextSlotEt.getDay(), 1);
+  assert.equal(plan.nextSlotEt.getHours(), 9);
+});
+
+test("startup after the 9:00 slot already ran: wait for 15:00, no immediate run", () => {
+  const out = planStartup({ now: et("2026-10-14T11:47:30.000"), lastCheckedAt: et("2026-10-14T09:00:31.000") });
+  assert.equal(out.reason, "next-slot");
+  assert.equal(out.delayMs, 3 * HOUR + 12 * MIN + 30 * 1000);
+});
+
+test("startup with the 9:00 slot missed (last check yesterday): catch up after the settle delay", () => {
+  const out = planStartup({ now: et("2026-10-14T11:47:30.000"), lastCheckedAt: et("2026-10-13T15:01:10.000") });
+  assert.equal(out.reason, "missed-slot-catch-up");
+  assert.equal(out.delayMs, STARTUP_SETTLE_MS);
+});
+
+test("startup with no history at all counts as a missed slot", () => {
+  const out = planStartup({ now: et("2026-10-14T11:47:30.000"), lastCheckedAt: null });
+  assert.equal(out.reason, "missed-slot-catch-up");
+});
+
+test("startup catch-up never overshoots the next slot", () => {
+  const out = planStartup({ now: et("2026-10-14T14:58:00.000"), lastCheckedAt: et("2026-10-13T15:01:10.000") });
+  assert.equal(out.reason, "missed-slot-catch-up");
+  assert.equal(out.delayMs, 2 * MIN);
+});
+
+test("startup outside the window never catches up — it waits for the next slot", () => {
+  const night = planStartup({ now: et("2026-10-14T21:00:00.000"), lastCheckedAt: et("2026-10-01T15:00:00.000") });
+  assert.equal(night.reason, "next-slot");
+  assert.equal(night.delayMs, 12 * HOUR);
+  const sat = planStartup({ now: et("2026-10-17T10:00:00.000"), lastCheckedAt: null });
+  assert.equal(sat.reason, "next-slot");
+  assert.equal(sat.delayMs, 47 * HOUR);
+});
+
+test("lastCheckedAtFromHistory picks the latest lastFetchAt and ignores junk", () => {
+  const history = {
+    A: { lastFetchAt: "2026-10-13T19:01:10.938Z" },
+    B: { lastFetchAt: "2026-10-13T19:01:12.100Z" },
+    C: { lastFetchAt: "not-a-date" },
+    D: {},
+  };
+  assert.equal(lastCheckedAtFromHistory(history).toISOString(), "2026-10-13T19:01:12.100Z");
+  assert.equal(lastCheckedAtFromHistory({}), null);
+  assert.equal(lastCheckedAtFromHistory(null), null);
+});
+
+test("any failed check notifies Discord except OTP failures, which have their own notices", () => {
+  assert.equal(shouldNotifyCheckFailure(new Error("locator.count: Target page, context or browser has been closed")), true);
+  const expired = new Error("SESSION_EXPIRED");
+  expired.code = "SESSION_EXPIRED";
+  assert.equal(shouldNotifyCheckFailure(expired), true);
+  const otp = new Error("Login did not stick");
+  otp.code = "OTP_LOGIN_FAILED";
+  assert.equal(shouldNotifyCheckFailure(otp), false);
+  const denied = new Error("FDA denied");
+  denied.code = "OTP_PERMISSION_DENIED";
+  assert.equal(shouldNotifyCheckFailure(denied), false);
 });

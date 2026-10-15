@@ -12,7 +12,7 @@ Automated USCIS case status monitor that checks your immigration cases periodica
 - **Smart session management** — reuses saved auth tokens; auto-re-authenticates when expired
 - **Change detection** — SHA-based field-level diff on `updatedAt`, `events`, `closed`, `actionRequired`
 - **Discord notifications** — sends alerts on case changes (or a quiet heartbeat when nothing changed)
-- **Built-in scheduler** — runs on weekdays 9 AM–8 PM ET, every 3 hours
+- **Built-in scheduler** — checks at 9:00 and 15:00 ET on weekdays; on (re)start it waits for the next slot instead of running immediately (catching up a missed slot after a 5-minute settle delay)
 
 ## Requirements
 
@@ -155,7 +155,7 @@ This starts the scheduler as a background daemon — safe to close the terminal.
 
 - PID saved to `state/scheduler.pid`
 - Logs written to `state/scheduler.log`
-- Schedule: weekdays 9 AM–8 PM ET, every 3 hours
+- Schedule: weekdays at 9:00 and 15:00 ET (any failed check is reported to Discord)
 
 The scheduler automatically:
 1. Checks if current time is within schedule
